@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("postbot")
 
-TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAEoP22lRBgUt69EXv9OrcP4H5Gyzr_hJRc")
+TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAHm05ZMBbdI-5kffaiEvw1mqLPCFflWQO0")
 MASTER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
 PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.environ.get("POSTBOT_DB", "postbot_data.db")
@@ -148,11 +148,14 @@ async def verify_and_bind(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return
 
         if chat_type == "channel":
-            if not (member.can_post_messages or member.can_edit_messages):
+            can_post = getattr(member, "can_post_messages", False)
+            can_edit = getattr(member, "can_edit_messages", False)
+            if not (can_post or can_edit):
                 await reply(update, "❌ 频道里机器人需要「发消息」权限。")
                 return
         elif chat_type in ("group", "supergroup"):
-            if member.can_send_messages is False:
+            # 管理员类型没有 can_send_messages，只有受限成员才有
+            if getattr(member, "can_send_messages", True) is False:
                 await reply(update, "❌ 群里机器人需要「发消息」权限。")
                 return
 
