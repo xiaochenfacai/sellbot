@@ -1,16 +1,19 @@
 """
-PostBot - Telegram 发布机器人
-私聊发图片/视频/文字 → 发布到已绑定的群或频道
+PostBot - 发布 + 售卖机器人
+管理员私聊发作品 → 设三档价格 → 发布到群/频道（带购买按钮）
+买家点按钮 → 选支付方式 → 上传凭证+地址 → 管理员审核
 """
 
 import logging
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime
 
 from flask import Flask
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Forbidden
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -30,13 +33,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("postbot")
 
-TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAHm05ZMBbdI-5kffaiEvw1mqLPCFflWQO0")
+TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAFq3s3WlayLgCgwldWDPFZ8zhTuoJOTJsw")
 MASTER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
 PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.environ.get("POSTBOT_DB", "postbot_data.db")
 
+# 支付信息（也可用 /setpay 命令修改）
+DEFAULT_PAY = {
+    "usdt": os.environ.get("USDT_ADDRESS", "请设置USDT地址"),
+    "kpay": os.environ.get("KPAY_PHONE", "请设置KPay手机号"),
+    "wavepay": os.environ.get("WAVEPAY_PHONE", "请设置WavePay手机号"),
+    "admin_username": os.environ.get("ADMIN_USERNAME", "请设置管理员用户名"),
+}
+
 flask_app = Flask(__name__)
-_pending: dict[int, dict] = {}
+_admin_drafts: dict[int, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -46,17 +57,57 @@ def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS targets (
-                chat_id   INTEGER PRIMARY KEY,
-                title     TEXT NOT NULL,
-                chat_type TEXT NOT NULL,
-                added_at  TEXT NOT NULL
+                chat_id INTEGER PRIMARY KEY, title TEXT, chat_type TEXT, added_at TEXT
             )"""
         )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS prefs (
-                user_id         INTEGER PRIMARY KEY,
-                default_target  INTEGER
+                user_id INTEGER PRIMARY KEY, default_target INTEGER
             )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, value TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS listings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_type TEXT, file_id TEXT, caption TEXT,
+                price1 REAL, price2 REAL, price3 REAL,
+                created_at TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                listing_id INTEGER, buyer_id INTEGER, buyer_name TEXT,
+                qty INTEGER, price REAL, payment_method TEXT,
+                proof_file_id TEXT, address TEXT, status TEXT,
+                created_at TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS buyer_sessions (
+                user_id INTEGER PRIMARY KEY, order_id INTEGER, step TEXT
+            )"""
+        )
+        for k, v in DEFAULT_PAY.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v)
+            )
+
+
+def db_get_setting(key: str) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else DEFAULT_PAY.get(key, "")
+
+
+def db_set_setting(key: str, value: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
         )
 
 
@@ -70,7 +121,7 @@ def db_add_target(chat_id: int, title: str, chat_type: str):
 
 def db_remove_target(chat_id: int):
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM targets WHERE chat_id = ?", (chat_id,))
+        conn.execute("DELETE FROM targets WHERE chat_id=?", (chat_id,))
 
 
 def db_list_targets() -> list[dict]:
@@ -84,24 +135,84 @@ def db_list_targets() -> list[dict]:
 def db_set_default(user_id: int, chat_id: int | None):
     with sqlite3.connect(DB_PATH) as conn:
         if chat_id is None:
-            conn.execute("DELETE FROM prefs WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM prefs WHERE user_id=?", (user_id,))
         else:
-            conn.execute(
-                "INSERT OR REPLACE INTO prefs VALUES (?, ?)",
-                (user_id, chat_id),
-            )
+            conn.execute("INSERT OR REPLACE INTO prefs VALUES (?, ?)", (user_id, chat_id))
 
 
 def db_get_default(user_id: int) -> int | None:
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT default_target FROM prefs WHERE user_id = ?", (user_id,)
-        ).fetchone()
+        row = conn.execute("SELECT default_target FROM prefs WHERE user_id=?", (user_id,)).fetchone()
     return row[0] if row else None
 
 
+def db_create_listing(media_type, file_id, caption, p1, p2, p3) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "INSERT INTO listings (media_type,file_id,caption,price1,price2,price3,created_at) VALUES (?,?,?,?,?,?,?)",
+            (media_type, file_id, caption or "", p1, p2, p3, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        return cur.lastrowid
+
+
+def db_get_listing(lid: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT * FROM listings WHERE id=?", (lid,)).fetchone()
+    if not row:
+        return None
+    cols = ["id", "media_type", "file_id", "caption", "price1", "price2", "price3", "created_at"]
+    return dict(zip(cols, row))
+
+
+def db_create_order(listing_id, buyer_id, buyer_name, qty, price) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "INSERT INTO orders (listing_id,buyer_id,buyer_name,qty,price,status,created_at) VALUES (?,?,?,?,?,?,?)",
+            (listing_id, buyer_id, buyer_name, qty, price, "pending_pay", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        return cur.lastrowid
+
+
+def db_get_order(oid: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    if not row:
+        return None
+    cols = ["id", "listing_id", "buyer_id", "buyer_name", "qty", "price",
+            "payment_method", "proof_file_id", "address", "status", "created_at"]
+    return dict(zip(cols, row))
+
+
+def db_update_order(oid: int, **fields):
+    if not fields:
+        return
+    sets = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [oid]
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(f"UPDATE orders SET {sets} WHERE id=?", vals)
+
+
+def db_set_buyer_session(user_id: int, order_id: int | None, step: str | None):
+    with sqlite3.connect(DB_PATH) as conn:
+        if step is None:
+            conn.execute("DELETE FROM buyer_sessions WHERE user_id=?", (user_id,))
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO buyer_sessions VALUES (?,?,?)",
+                (user_id, order_id, step),
+            )
+
+
+def db_get_buyer_session(user_id: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT order_id, step FROM buyer_sessions WHERE user_id=?", (user_id,)).fetchone()
+    if not row:
+        return None
+    return {"order_id": row[0], "step": row[1]}
+
+
 # ---------------------------------------------------------------------------
-# 工具函数
+# 工具
 # ---------------------------------------------------------------------------
 def is_master(user_id: int | None) -> bool:
     return user_id == MASTER_ID
@@ -122,19 +233,67 @@ def forward_chat(message):
     return None
 
 
+def parse_prices(text: str) -> tuple[float, float, float] | None:
+    nums = re.findall(r"\d+(?:\.\d+)?", text.replace(",", " "))
+    if len(nums) >= 3:
+        return float(nums[0]), float(nums[1]), float(nums[2])
+    return None
+
+
+def extract_media(message):
+    if message.photo:
+        return "photo", message.photo[-1].file_id
+    if message.video:
+        return "video", message.video.file_id
+    if message.animation:
+        return "animation", message.animation.file_id
+    return None, None
+
+
+def price_buttons(listing_id: int, p1: float, p2: float, p3: float) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🛒 买1个 — {p1}", callback_data=f"buy:{listing_id}:1")],
+        [InlineKeyboardButton(f"🛒 买2个 — {p2}", callback_data=f"buy:{listing_id}:2")],
+        [InlineKeyboardButton(f"🛒 买3个 — {p3}", callback_data=f"buy:{listing_id}:3")],
+    ])
+
+
+def pay_buttons(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 USDT", callback_data=f"pay:{order_id}:usdt")],
+        [InlineKeyboardButton("📱 KPay", callback_data=f"pay:{order_id}:kpay")],
+        [InlineKeyboardButton("📱 WavePay", callback_data=f"pay:{order_id}:wavepay")],
+    ])
+
+
+def review_buttons(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ 购买成功", callback_data=f"review:{order_id}:ok"),
+            InlineKeyboardButton("❌ 购买失败", callback_data=f"review:{order_id}:fail"),
+        ]
+    ])
+
+
 def target_label(t: dict) -> str:
     kind = "频道" if t["type"] == "channel" else "群组"
     return f"{t['title']} ({kind})"
 
 
-def build_keyboard(targets: list[dict], prefix: str) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(target_label(t), callback_data=f"{prefix}:{t['id']}")]
-        for t in targets
-    ]
-    rows.append([InlineKeyboardButton("📢 全部发送", callback_data=f"{prefix}:all")])
+def build_target_keyboard(targets: list[dict], prefix: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(target_label(t), callback_data=f"{prefix}:{t['id']}")] for t in targets]
     rows.append([InlineKeyboardButton("❌ 取消", callback_data=f"{prefix}:cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+def pay_info(method: str) -> str:
+    if method == "usdt":
+        return f"💎 <b>USDT (TRC20)</b>\n<code>{db_get_setting('usdt')}</code>"
+    if method == "kpay":
+        return f"📱 <b>KPay</b>\n<code>{db_get_setting('kpay')}</code>"
+    if method == "wavepay":
+        return f"📱 <b>WavePay</b>\n<code>{db_get_setting('wavepay')}</code>"
+    return ""
 
 
 async def verify_and_bind(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -142,81 +301,104 @@ async def verify_and_bind(update: Update, context: ContextTypes.DEFAULT_TYPE,
     try:
         me = await context.bot.get_me()
         member = await context.bot.get_chat_member(chat_id, me.id)
-
         if member.status not in ("administrator", "creator"):
             await reply(update, "❌ 请先把机器人设为管理员。")
             return
-
         if chat_type == "channel":
-            can_post = getattr(member, "can_post_messages", False)
-            can_edit = getattr(member, "can_edit_messages", False)
-            if not (can_post or can_edit):
+            if not (getattr(member, "can_post_messages", False) or getattr(member, "can_edit_messages", False)):
                 await reply(update, "❌ 频道里机器人需要「发消息」权限。")
                 return
         elif chat_type in ("group", "supergroup"):
-            # 管理员类型没有 can_send_messages，只有受限成员才有
             if getattr(member, "can_send_messages", True) is False:
                 await reply(update, "❌ 群里机器人需要「发消息」权限。")
                 return
-
         db_add_target(chat_id, title, chat_type)
-        await reply(update, f"✅ 已绑定：{title}\n\n现在可以私聊我发作品了。")
-        log.info("绑定成功 chat_id=%s title=%s", chat_id, title)
-
+        await reply(update, f"✅ 已绑定：{title}")
     except Exception as e:
-        log.exception("绑定失败 chat_id=%s", chat_id)
+        log.exception("绑定失败")
         await reply(update, f"❌ 绑定失败：{e}")
 
 
-async def publish_to(context: ContextTypes.DEFAULT_TYPE,
-                     from_chat: int, msg_id: int, target_ids: list[int]) -> tuple[int, int]:
-    ok, fail = 0, 0
-    for tid in target_ids:
-        try:
-            await context.bot.copy_message(chat_id=tid, from_chat_id=from_chat, message_id=msg_id)
-            ok += 1
-        except Exception as e:
-            fail += 1
-            log.error("发布失败 target=%s err=%s", tid, e)
-    return ok, fail
+async def send_listing_to_chat(context, chat_id: int, listing: dict) -> bool:
+    kb = price_buttons(listing["id"], listing["price1"], listing["price2"], listing["price3"])
+    cap = listing["caption"] or "🛍 精选作品"
+    try:
+        if listing["media_type"] == "photo":
+            await context.bot.send_photo(chat_id, listing["file_id"], caption=cap, reply_markup=kb)
+        elif listing["media_type"] == "video":
+            await context.bot.send_video(chat_id, listing["file_id"], caption=cap, reply_markup=kb)
+        else:
+            await context.bot.send_animation(chat_id, listing["file_id"], caption=cap, reply_markup=kb)
+        return True
+    except Exception as e:
+        log.error("发布商品失败 chat=%s err=%s", chat_id, e)
+        return False
+
+
+async def show_payment_menu(context, user_id: int, order_id: int):
+    order = db_get_order(order_id)
+    if not order:
+        await context.bot.send_message(user_id, "订单不存在或已过期。")
+        return
+    text = (
+        f"🛍 <b>确认订单 #{order_id}</b>\n"
+        f"数量：{order['qty']} 个\n"
+        f"金额：<b>{order['price']}</b>\n\n"
+        f"请选择支付方式："
+    )
+    await context.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=pay_buttons(order_id))
 
 
 # ---------------------------------------------------------------------------
 # 命令
 # ---------------------------------------------------------------------------
-HELP_PRIVATE = (
-    "📮 <b>发布机器人</b>\n\n"
-    "<b>绑定群/频道：</b>\n"
-    "① 群里发 /bind\n"
-    "② 私聊转发频道/群消息给我\n"
-    "③ 私聊发 /bind -100xxxxxxxxxx\n\n"
-    "<b>发布作品：</b>\n"
-    "私聊发图片、视频、文字 → 选择目标\n\n"
+HELP_ADMIN = (
+    "📮 <b>发布售卖机器人</b>\n\n"
+    "<b>发作品流程：</b>\n"
+    "1. 私聊发图片/视频\n"
+    "2. 回复三个价格，例如：\n"
+    "   <code>80, 150, 220</code>\n"
+    "   （买1个/买2个/买3个）\n"
+    "3. 选择发布到群/频道\n\n"
     "<b>命令：</b>\n"
-    "/ping — 测试在线\n"
-    "/id — 查看 ID\n"
-    "/targets — 已绑定列表\n"
+    "/setpay — 设置收款信息\n"
+    "/targets — 已绑定群/频道\n"
     "/default — 默认发布目标\n"
-    "/unbind — 解除绑定（在群内发）"
+    "/bind /unbind /ping /id"
 )
 
-HELP_GROUP = (
-    "📮 发布机器人已就绪\n"
-    "本群 ID：<code>{cid}</code>\n\n"
-    "管理员发 /bind 绑定\n"
-    "发 /ping 测试在线"
+HELP_BUYER = (
+    "👋 欢迎！\n\n"
+    "请从频道/群里的商品按钮进入购买。\n"
+    "如有问题请联系 @{admin}"
 )
+
+HELP_GROUP = "📮 机器人已就绪\n群ID：<code>{cid}</code>\n管理员发 /bind 绑定"
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
+    if not user:
+        return
 
     if chat.type == "private":
-        if not is_master(user.id if user else None):
-            await reply(update, "此机器人仅供管理员使用。")
+        # 买家从按钮跳转：/start buy_列表ID_数量
+        if context.args and context.args[0].startswith("buy_"):
+            parts = context.args[0].split("_")
+            if len(parts) == 3:
+                await start_buy_flow(context, user, int(parts[1]), int(parts[2]))
+                return
+        if context.args and context.args[0].startswith("pay_"):
+            order_id = int(context.args[0].split("_")[1])
+            await show_payment_menu(context, user.id, order_id)
             return
-        await reply(update, HELP_PRIVATE, parse_mode="HTML")
+
+        if is_master(user.id):
+            await reply(update, HELP_ADMIN, parse_mode="HTML")
+        else:
+            admin = db_get_setting("admin_username").lstrip("@")
+            await reply(update, HELP_BUYER.format(admin=admin))
     else:
         await reply(update, HELP_GROUP.format(cid=chat.id), parse_mode="HTML")
 
@@ -226,73 +408,76 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    await reply(update, f"✅ 机器人在线\n聊天 ID：<code>{chat.id}</code>", parse_mode="HTML")
+    await reply(update, f"✅ 在线\nID：<code>{update.effective_chat.id}</code>", parse_mode="HTML")
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    chat = update.effective_chat
-    uid = user.id if user else "?"
     ok = is_master(user.id if user else None)
     await reply(
         update,
-        f"你的 ID：<code>{uid}</code>\n"
-        f"聊天 ID：<code>{chat.id}</code>\n"
-        f"管理员 ID：<code>{MASTER_ID}</code>\n"
-        f"匹配：{'✅ 是管理员' if ok else '❌ 不是管理员'}",
+        f"你的ID：<code>{user.id if user else '?'}</code>\n"
+        f"管理员：<code>{MASTER_ID}</code>\n"
+        f"{'✅ 是管理员' if ok else '❌ 不是管理员'}",
         parse_mode="HTML",
     )
+
+
+async def cmd_setpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_master(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await reply(
+            update,
+            "当前收款设置：\n\n"
+            f"USDT：<code>{db_get_setting('usdt')}</code>\n"
+            f"KPay：<code>{db_get_setting('kpay')}</code>\n"
+            f"WavePay：<code>{db_get_setting('wavepay')}</code>\n"
+            f"联系账号：@{db_get_setting('admin_username').lstrip('@')}\n\n"
+            "修改格式：\n"
+            "/setpay usdt 你的地址\n"
+            "/setpay kpay 手机号\n"
+            "/setpay wavepay 手机号\n"
+            "/setpay admin 你的用户名",
+            parse_mode="HTML",
+        )
+        return
+    key = context.args[0].lower()
+    val = " ".join(context.args[1:])
+    mapping = {"usdt": "usdt", "kpay": "kpay", "wavepay": "wavepay", "admin": "admin_username"}
+    if key not in mapping:
+        await reply(update, "可选：usdt / kpay / wavepay / admin")
+        return
+    db_set_setting(mapping[key], val.lstrip("@") if key == "admin" else val)
+    await reply(update, f"✅ 已更新 {key}")
 
 
 async def cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
-
-    # 私聊绑定
     if chat.type == "private":
         if not is_master(user.id if user else None):
             await reply(update, "只有管理员可以绑定。")
             return
-
         if context.args:
             try:
-                target_id = int(context.args[0])
-            except ValueError:
-                await reply(update, "格式：/bind -100xxxxxxxxxx")
-                return
-            try:
-                t = await context.bot.get_chat(target_id)
+                t = await context.bot.get_chat(int(context.args[0]))
             except Exception as e:
-                await reply(update, f"找不到群/频道：{e}")
+                await reply(update, f"找不到：{e}")
                 return
             await verify_and_bind(update, context, t.id, t.title or str(t.id), t.type)
             return
-
-        await reply(
-            update,
-            "绑定方法：\n\n"
-            "① 转发群/频道消息到这里（推荐）\n"
-            "② 在群里发 /bind\n"
-            "③ /bind -100xxxxxxxxxx",
-        )
+        await reply(update, "转发群/频道消息到这里，或 /bind -100xxx")
         return
-
-    # 群/频道内绑定
     if not is_master(user.id if user else None):
         await reply(update, "只有管理员可以绑定。")
         return
-
     await verify_and_bind(update, context, chat.id, chat.title or str(chat.id), chat.type)
 
 
 async def cmd_unbind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    user = update.effective_user
-    if chat.type == "private":
-        return
-    if not is_master(user.id if user else None):
-        await reply(update, "只有管理员可以操作。")
+    if chat.type == "private" or not is_master(update.effective_user.id):
         return
     db_remove_target(chat.id)
     await reply(update, "✅ 已解除绑定。")
@@ -303,14 +488,13 @@ async def cmd_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     targets = db_list_targets()
     if not targets:
-        await reply(update, "暂无绑定的群/频道。")
+        await reply(update, "暂无绑定。")
         return
     default = db_get_default(update.effective_user.id)
-    lines = ["📋 已绑定：\n"]
+    lines = ["📋 已绑定："]
     for i, t in enumerate(targets, 1):
         mark = " ⭐" if default == t["id"] else ""
-        kind = "频道" if t["type"] == "channel" else "群组"
-        lines.append(f"{i}. {t['title']} ({kind}){mark}\n   ID: {t['id']}")
+        lines.append(f"{i}. {t['title']}{mark}\n   {t['id']}")
     await reply(update, "\n".join(lines))
 
 
@@ -321,74 +505,249 @@ async def cmd_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not targets:
         await reply(update, "请先绑定群/频道。")
         return
-    await reply(update, "选择默认发布目标：", reply_markup=build_keyboard(targets, "def"))
+    await reply(update, "选择默认发布目标：", reply_markup=build_target_keyboard(targets, "def"))
 
 
 # ---------------------------------------------------------------------------
-# 私聊发布 & 转发绑定
+# 管理员发作品 + 设价格
 # ---------------------------------------------------------------------------
-MEDIA_FILTER = (
-    filters.PHOTO | filters.VIDEO | filters.ANIMATION
-    | filters.Document.ALL | filters.AUDIO | filters.VOICE
-    | filters.VIDEO_NOTE | (filters.TEXT & ~filters.COMMAND)
-)
-
-
-async def on_private_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
+async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not is_master(update.effective_user.id):
         return
-    if not is_master(update.effective_user.id):
+    media_type, file_id = extract_media(update.message)
+    if not media_type:
         return
-
-    msg = update.message
-    targets = db_list_targets()
-
-    if not targets:
-        await msg.reply_text(
-            "还没有绑定任何群/频道。\n\n"
-            "请先：\n"
-            "① 把机器人拉进群/频道并设管理员\n"
-            "② 群里发 /bind，或转发消息给我绑定"
-        )
-        return
-
-    default = db_get_default(update.effective_user.id)
-    if default and any(t["id"] == default for t in targets):
-        ok, fail = await publish_to(context, msg.chat_id, msg.message_id, [default])
-        text = "✅ 已发布到默认目标"
-        if fail:
-            text += f"\n⚠️ 发布失败 {fail} 次"
-        await msg.reply_text(text)
-        return
-
-    _pending[update.effective_user.id] = {
-        "from_chat": msg.chat_id,
-        "msg_id": msg.message_id,
+    _admin_drafts[update.effective_user.id] = {
+        "media_type": media_type,
+        "file_id": file_id,
+        "caption": update.message.caption or "",
     }
-    await msg.reply_text("选择发布目标：", reply_markup=build_keyboard(targets, "pub"))
-
-
-async def on_forward_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        return
-    if not is_master(update.effective_user.id):
-        return
-
-    source = forward_chat(update.message)
-    if not source or source.type not in ("channel", "group", "supergroup"):
-        return
-
-    await verify_and_bind(
-        update, context,
-        source.id,
-        source.title or str(source.id),
-        source.type,
+    await update.message.reply_text(
+        "📸 收到作品！\n\n"
+        "请发送三个价格（买1个 / 买2个 / 买3个）：\n\n"
+        "例如：\n"
+        "<code>80, 150, 220</code>\n"
+        "或：\n"
+        "<code>1=80\n2=150\n3=220</code>",
+        parse_mode="HTML",
     )
 
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_admin_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not is_master(update.effective_user.id):
+        return
+    uid = update.effective_user.id
+    draft = _admin_drafts.get(uid)
+    if not draft:
+        return
+
+    prices = parse_prices(update.message.text)
+    if not prices:
+        await update.message.reply_text("❌ 格式不对，请发三个数字，例如：80, 150, 220")
+        return
+
+    draft["price1"], draft["price2"], draft["price3"] = prices
+    draft["step"] = "pick_target"
+
+    targets = db_list_targets()
+    if not targets:
+        await update.message.reply_text("请先绑定群/频道（/bind）")
+        _admin_drafts.pop(uid, None)
+        return
+
+    default = db_get_default(uid)
+    if default and any(t["id"] == default for t in targets):
+        lid = db_create_listing(
+            draft["media_type"], draft["file_id"], draft["caption"],
+            draft["price1"], draft["price2"], draft["price3"],
+        )
+        listing = db_get_listing(lid)
+        ok = await send_listing_to_chat(context, default, listing)
+        _admin_drafts.pop(uid, None)
+        await update.message.reply_text(
+            f"{'✅ 已发布到默认目标' if ok else '❌ 发布失败'}\n"
+            f"价格：{prices[0]} / {prices[1]} / {prices[2]}"
+        )
+        return
+
+    await update.message.reply_text(
+        f"价格已设置：{prices[0]} / {prices[1]} / {prices[2]}\n\n请选择发布到哪里：",
+        reply_markup=build_target_keyboard(targets, "sale"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 买家购买流程
+# ---------------------------------------------------------------------------
+async def start_buy_flow(context, user, listing_id: int, qty: int):
+    listing = db_get_listing(listing_id)
+    if not listing:
+        await context.bot.send_message(user.id, "商品不存在或已下架。")
+        return
+    price_map = {1: listing["price1"], 2: listing["price2"], 3: listing["price3"]}
+    if qty not in price_map:
+        await context.bot.send_message(user.id, "无效的数量。")
+        return
+    name = user.full_name or user.username or str(user.id)
+    oid = db_create_order(listing_id, user.id, name, qty, price_map[qty])
+    await show_payment_menu(context, user.id, oid)
+
+
+async def on_buy_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    _, lid, qty = query.data.split(":")
+    listing_id, qty = int(lid), int(qty)
+    buyer = query.from_user
+
+    listing = db_get_listing(listing_id)
+    if not listing:
+        await query.answer("商品已下架", show_alert=True)
+        return
+
+    price_map = {1: listing["price1"], 2: listing["price2"], 3: listing["price3"]}
+    price = price_map.get(qty)
+    if not price:
+        await query.answer("无效选项", show_alert=True)
+        return
+
+    name = buyer.full_name or buyer.username or str(buyer.id)
+    oid = db_create_order(listing_id, buyer.id, name, qty, price)
+
+    try:
+        await show_payment_menu(context, buyer.id, oid)
+        await query.answer("请查看私聊消息 👉")
+    except Forbidden:
+        me = await context.bot.get_me()
+        await query.answer(url=f"https://t.me/{me.username}?start=pay_{oid}")
+
+
+async def on_pay_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, oid, method = query.data.split(":")
+    order_id = int(oid)
+    order = db_get_order(order_id)
+    if not order or query.from_user.id != order["buyer_id"]:
+        await query.answer("订单无效", show_alert=True)
+        return
+
+    db_update_order(order_id, payment_method=method)
+    db_set_buyer_session(query.from_user.id, order_id, "await_proof")
+
+    info = pay_info(method)
+    text = (
+        f"{info}\n\n"
+        f"应付金额：<b>{order['price']}</b>\n\n"
+        f"📌 <b>请按以下步骤操作：</b>\n"
+        f"1️⃣ 完成支付\n"
+        f"2️⃣ 发送 <b>支付成功截图</b>\n"
+        f"3️⃣ 再发送 <b>收货地址</b>（文字）\n\n"
+        f"⚠️ 请确保支付信息正确，假图或错付将无法发货。"
+    )
+    await query.edit_message_text(text, parse_mode="HTML")
     await query.answer()
+
+
+async def on_buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or is_master(update.effective_user.id):
+        return
+
+    session = db_get_buyer_session(update.effective_user.id)
+    if not session:
+        return
+
+    order = db_get_order(session["order_id"])
+    if not order:
+        db_set_buyer_session(update.effective_user.id, None, None)
+        return
+
+    if session["step"] == "await_proof":
+        if not update.message.photo:
+            await update.message.reply_text("请先发送支付成功截图（图片）。")
+            return
+        proof_id = update.message.photo[-1].file_id
+        db_update_order(order["id"], proof_file_id=proof_id)
+        db_set_buyer_session(update.effective_user.id, order["id"], "await_address")
+        await update.message.reply_text("✅ 已收到截图。\n\n请发送您的收货地址（文字）：")
+        return
+
+    if session["step"] == "await_address":
+        address = update.message.text
+        if not address:
+            await update.message.reply_text("请发送文字格式的收货地址。")
+            return
+        db_update_order(order["id"], address=address, status="pending_review")
+        db_set_buyer_session(update.effective_user.id, None, None)
+        proof_id = order.get("proof_file_id")
+
+        await update.message.reply_text("✅ 已提交！请等待管理员审核，稍后通知您结果。")
+
+        method = order.get("payment_method") or "?"
+        admin_text = (
+            f"🔔 <b>新订单 #{order['id']}</b>\n\n"
+            f"买家：{order['buyer_name']} (<code>{order['buyer_id']}</code>)\n"
+            f"数量：{order['qty']} 个\n"
+            f"金额：{order['price']}\n"
+            f"支付：{method.upper()}\n"
+            f"地址：{address}\n\n"
+            f"请核对支付截图后点击："
+        )
+        await context.bot.send_message(
+            MASTER_ID, admin_text, parse_mode="HTML", reply_markup=review_buttons(order["id"])
+        )
+        await context.bot.send_photo(
+            MASTER_ID, proof_id,
+            caption=f"订单 #{order['id']} 支付截图",
+        )
+
+
+async def on_review_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_master(query.from_user.id):
+        await query.answer("无权限", show_alert=True)
+        return
+
+    _, oid, result = query.data.split(":")
+    order_id = int(oid)
+    order = db_get_order(order_id)
+    if not order:
+        await query.answer("订单不存在", show_alert=True)
+        return
+
+    admin_user = db_get_setting("admin_username").lstrip("@")
+    buyer_id = order["buyer_id"]
+
+    if result == "ok":
+        db_update_order(order_id, status="success")
+        buyer_msg = (
+            "🎉 <b>恭喜您购买成功！</b>\n\n"
+            "您的订单已确认，预计 <b>7-15 天</b> 内发货。\n"
+            "如未收到货物，请联系管理员："
+            f" @{admin_user}"
+        )
+        await query.edit_message_text(f"✅ 订单 #{order_id} 已确认成功")
+    else:
+        db_update_order(order_id, status="failed")
+        buyer_msg = (
+            "❌ <b>购买失败</b>\n\n"
+            "支付凭证未通过审核，请详细核对后重新支付。\n"
+            "如有疑问请联系："
+            f" @{admin_user}"
+        )
+        await query.edit_message_text(f"❌ 订单 #{order_id} 已拒绝")
+
+    try:
+        await context.bot.send_message(buyer_id, buyer_msg, parse_mode="HTML")
+    except Exception as e:
+        log.error("通知买家失败: %s", e)
+
+    await query.answer()
+
+
+# ---------------------------------------------------------------------------
+# 管理员回调（发布/设置）
+# ---------------------------------------------------------------------------
+async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     if not is_master(query.from_user.id):
         return
 
@@ -398,65 +757,74 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "def":
         if value == "cancel":
             await query.edit_message_text("已取消。")
-        elif value == "all":
-            db_set_default(uid, None)
-            await query.edit_message_text("已清除默认目标。")
         else:
             db_set_default(uid, int(value))
             targets = {t["id"]: t for t in db_list_targets()}
-            name = targets.get(int(value), {}).get("title", value)
-            await query.edit_message_text(f"⭐ 默认目标：{name}")
+            await query.edit_message_text(f"⭐ 默认：{targets.get(int(value), {}).get('title', value)}")
+        await query.answer()
         return
 
-    if action == "pub":
-        pending = _pending.pop(uid, None)
-        if not pending:
-            await query.edit_message_text("内容已过期，请重新发送。")
-            return
-        if value == "cancel":
+    if action == "sale":
+        draft = _admin_drafts.get(uid)
+        if not draft or value == "cancel":
+            _admin_drafts.pop(uid, None)
             await query.edit_message_text("已取消发布。")
+            await query.answer()
             return
 
-        targets = db_list_targets()
-        ids = [t["id"] for t in targets] if value == "all" else [int(value)]
-        ok, fail = await publish_to(context, pending["from_chat"], pending["msg_id"], ids)
-        text = f"✅ 成功发布到 {ok} 个目标"
-        if fail:
-            text += f"\n⚠️ {fail} 个失败"
-        await query.edit_message_text(text)
+        lid = db_create_listing(
+            draft["media_type"], draft["file_id"], draft["caption"],
+            draft["price1"], draft["price2"], draft["price3"],
+        )
+        listing = db_get_listing(lid)
+        ok = await send_listing_to_chat(context, int(value), listing)
+        _admin_drafts.pop(uid, None)
+        await query.edit_message_text(
+            f"{'✅ 发布成功' if ok else '❌ 发布失败'}\n"
+            f"商品ID：{lid}\n"
+            f"价格：{listing['price1']}/{listing['price2']}/{listing['price3']}"
+        )
+        await query.answer()
+        return
 
 
-# ---------------------------------------------------------------------------
-# 事件 & 日志
-# ---------------------------------------------------------------------------
+async def on_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data
+    if data.startswith("buy:"):
+        await on_buy_click(update, context)
+    elif data.startswith("pay:"):
+        await on_pay_click(update, context)
+    elif data.startswith("review:"):
+        await on_review_click(update, context)
+    elif data.startswith(("def:", "sale:")):
+        await on_admin_callback(update, context)
+
+
+async def on_forward_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not is_master(update.effective_user.id):
+        return
+    source = forward_chat(update.message)
+    if not source or source.type not in ("channel", "group", "supergroup"):
+        return
+    await verify_and_bind(update, context, source.id, source.title or str(source.id), source.type)
+
+
 async def on_bot_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.my_chat_member
     if not m or m.new_chat_member.status not in ("administrator", "member"):
         return
     chat = m.chat
-    if chat.type not in ("group", "supergroup", "channel"):
-        return
-    try:
-        await context.bot.send_message(
-            chat.id,
-            HELP_GROUP.format(cid=chat.id),
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        log.warning("进群消息发送失败: %s", e)
+    if chat.type in ("group", "supergroup", "channel"):
+        try:
+            await context.bot.send_message(chat.id, HELP_GROUP.format(cid=chat.id), parse_mode="HTML")
+        except Exception:
+            pass
 
 
 async def on_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-    msg = update.effective_message
-    log.info(
-        "update chat=%s type=%s user=%s text=%s",
-        chat.id if chat else "?",
-        chat.type if chat else "?",
-        user.id if user else "?",
-        (msg.text[:60] if msg and msg.text else ""),
-    )
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    log.info("chat=%s user=%s text=%s", getattr(chat, "id", "?"), getattr(user, "id", "?"),
+             (msg.text[:50] if msg and msg.text else ""))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -464,7 +832,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Flask + 启动
+# 启动
 # ---------------------------------------------------------------------------
 @flask_app.route("/")
 def health():
@@ -478,35 +846,43 @@ def run_flask():
 def create_app() -> Application:
     app = Application.builder().token(TOKEN).build()
     app.add_error_handler(on_error)
-
-    # 日志（最低优先级）
     app.add_handler(MessageHandler(filters.ALL, on_log), group=-1)
-
-    # 进群事件
     app.add_handler(ChatMemberHandler(on_bot_joined, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    # 普通消息命令
     for cmd, handler in [
-        ("start", cmd_start), ("help", cmd_help),
-        ("ping", cmd_ping), ("id", cmd_id),
-        ("bind", cmd_bind), ("unbind", cmd_unbind),
-        ("targets", cmd_targets), ("default", cmd_default),
+        ("start", cmd_start), ("help", cmd_help), ("ping", cmd_ping), ("id", cmd_id),
+        ("bind", cmd_bind), ("unbind", cmd_unbind), ("targets", cmd_targets),
+        ("default", cmd_default), ("setpay", cmd_setpay),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
         app.add_handler(CommandHandler(cmd, handler, filters=filters.UpdateType.CHANNEL_POSTS))
 
-    # 回调 & 私聊
-    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(CallbackQueryHandler(on_callback_router))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.FORWARDED, on_forward_bind))
-    app.add_handler(MessageHandler(MEDIA_FILTER & filters.ChatType.PRIVATE, on_private_media))
-
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.PHOTO & ~filters.COMMAND,
+        on_admin_photo,
+    ))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.VIDEO & ~filters.COMMAND,
+        on_admin_photo,
+    ))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+        on_admin_prices,
+        block=False,
+    ))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & ~filters.COMMAND,
+        on_buyer_message,
+    ))
     return app
 
 
 def main():
     init_db()
     threading.Thread(target=run_flask, daemon=True).start()
-    log.info("PostBot 启动 port=%s master=%s", PORT, MASTER_ID)
+    log.info("PostBot 售卖版启动 port=%s master=%s", PORT, MASTER_ID)
     create_app().run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
