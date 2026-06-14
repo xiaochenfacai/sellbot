@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("postbot")
 
-TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAGXpfw2F0gQhglzPjKkeeq_WPpG38IyHYs")
+TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAEjyiqUZTJck25mzMhwIbv9y3AYPQ99TzI")
 MASTER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
 PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.environ.get("POSTBOT_DB", "postbot_data.db")
@@ -248,6 +248,12 @@ def extract_media(message):
         return "video", message.video.file_id
     if message.animation:
         return "animation", message.animation.file_id
+    if message.document:
+        mime = message.document.mime_type or ""
+        if mime.startswith("image/"):
+            return "photo", message.document.file_id
+        if mime.startswith("video/"):
+            return "video", message.document.file_id
     return None, None
 
 
@@ -558,19 +564,23 @@ async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     media_type, file_id = extract_media(update.message)
     if not media_type:
+        await update.message.reply_text("❌ 请发送图片或视频。")
         return
+    caption = update.message.caption or ""
+    if not caption and update.message.forward_from_chat:
+        caption = update.message.forward_from_chat.title or ""
     _admin_drafts[update.effective_user.id] = {
         "media_type": media_type,
         "file_id": file_id,
-        "caption": update.message.caption or "",
+        "caption": caption,
     }
     await update.message.reply_text(
         "📸 收到作品！\n\n"
-        "请发送三个价格（买1个 / 买2个 / 买3个）：\n\n"
+        "请发送三个价格（买1个 / 买2个 / 买3个），单位为缅币：\n\n"
         "例如：\n"
-        "<code>80, 150, 220</code>\n"
+        "<code>400000, 750000, 1000000</code>\n"
         "或：\n"
-        "<code>1=80\n2=150\n3=220</code>",
+        "<code>1=400000\n2=750000\n3=1000000</code>",
         parse_mode="HTML",
     )
 
@@ -864,6 +874,12 @@ async def on_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def on_forward_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or not is_master(update.effective_user.id):
         return
+
+    # 转发的图片/视频 → 发作品，不是绑定群
+    if extract_media(update.message)[0]:
+        await on_admin_photo(update, context)
+        return
+
     source = forward_chat(update.message)
     if not source or source.type not in ("channel", "group", "supergroup"):
         return
@@ -928,9 +944,13 @@ def create_app() -> Application:
     ))
 
     admin_only = filters.ChatType.PRIVATE & filters.User(user_id=MASTER_ID)
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.FORWARDED & admin_only, on_forward_bind))
-    app.add_handler(MessageHandler(admin_only & filters.PHOTO, on_admin_photo))
-    app.add_handler(MessageHandler(admin_only & filters.VIDEO, on_admin_photo))
+    admin_media = admin_only & (
+        filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.IMAGE
+    )
+
+    # 管理员发/转发作品（必须在 forward_bind 之前）
+    app.add_handler(MessageHandler(admin_media, on_admin_photo))
+    app.add_handler(MessageHandler(admin_only & filters.FORWARDED, on_forward_bind))
     app.add_handler(MessageHandler(admin_only & filters.TEXT & ~filters.COMMAND, on_admin_prices))
     return app
 
