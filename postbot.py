@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("postbot")
 
-TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAFeUWIUfOmK31XDahQq290xE-l4bk5CPU4")
+TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAGnCvKxtIKpl66w5gm0r9SPxM1mgxKlqDc")
 MASTER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
 PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.environ.get("POSTBOT_DB", "postbot_data.db")
@@ -278,12 +278,10 @@ async def reply(update: Update, text: str, **kwargs):
 
 
 def forward_chat(message):
-    if message.forward_from_chat:
-        return message.forward_from_chat
     origin = getattr(message, "forward_origin", None)
     if origin and getattr(origin, "chat", None):
         return origin.chat
-    return None
+    return getattr(message, "forward_from_chat", None)
 
 
 def parse_prices(text: str) -> tuple[float, float, float] | None:
