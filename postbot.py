@@ -5,6 +5,8 @@ PostBot - 发布 + 售卖机器人
 """
 
 import logging
+import asyncio
+import json
 import os
 import re
 import sqlite3
@@ -12,7 +14,7 @@ import threading
 from datetime import datetime
 
 from flask import Flask
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, Update
 from telegram.error import Forbidden
 from telegram.ext import (
     Application,
@@ -33,7 +35,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("postbot")
 
-TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAGnCvKxtIKpl66w5gm0r9SPxM1mgxKlqDc")
+TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAElwCm7-DdHEYcKoByEMTjMxtZDTmnOpKE")
 MASTER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
 PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.environ.get("POSTBOT_DB", "postbot_data.db")
@@ -48,6 +50,10 @@ DEFAULT_PAY = {
 }
 
 flask_app = Flask(__name__)
+
+# 多图相册暂存（Telegram 相册会分多条消息到达）
+_album_buffer: dict[tuple[int, str], dict] = {}
+_album_tasks: dict[tuple[int, str], asyncio.Task] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +429,18 @@ async def _send_media(context, chat_id, media_type, file_id, caption, reply_mark
     try:
         if media_type == "text":
             await context.bot.send_message(chat_id, caption or " ", reply_markup=reply_markup)
+        elif media_type == "album":
+            items = json.loads(file_id)
+            media = []
+            for i, item in enumerate(items):
+                cap = caption if i == 0 else None
+                if item["type"] == "video":
+                    media.append(InputMediaVideo(item["file_id"], caption=cap))
+                else:
+                    media.append(InputMediaPhoto(item["file_id"], caption=cap))
+            await context.bot.send_media_group(chat_id, media)
+            if reply_markup:
+                await context.bot.send_message(chat_id, "👇 点击购买", reply_markup=reply_markup)
         elif media_type == "photo":
             await context.bot.send_photo(chat_id, file_id, caption=caption or None, reply_markup=reply_markup)
         elif media_type == "video":
@@ -433,6 +451,46 @@ async def _send_media(context, chat_id, media_type, file_id, caption, reply_mark
     except Exception as e:
         log.error("发布失败 chat=%s err=%s", chat_id, e)
         return False
+
+
+def _album_key(user_id: int, media_group_id) -> tuple[int, str]:
+    return user_id, str(media_group_id)
+
+
+async def _schedule_album_finalize(context, user_id: int, media_group_id, chat_id: int):
+    key = _album_key(user_id, media_group_id)
+    old = _album_tasks.get(key)
+    if old and not old.done():
+        old.cancel()
+
+    async def job():
+        await asyncio.sleep(1.0)
+        data = _album_buffer.pop(key, None)
+        _album_tasks.pop(key, None)
+        if not data or not data.get("items"):
+            return
+        draft = db_get_draft(user_id)
+        if not draft or draft.get("step") != "await_content":
+            return
+        draft.update({
+            "media_type": "album",
+            "file_id": json.dumps(data["items"]),
+            "caption": data.get("caption") or "",
+            "step": "await_prices",
+        })
+        db_save_draft(user_id, draft)
+        n = len(data["items"])
+        await context.bot.send_message(
+            chat_id,
+            f"📸 收到 {n} 张图片！\n\n"
+            "请发送三个价格（缅币），例如：\n"
+            "<code>400000, 750000, 1000000</code>\n\n"
+            "或点「无价发布」：",
+            parse_mode="HTML",
+            reply_markup=price_prompt_keyboard(),
+        )
+
+    _album_tasks[key] = asyncio.create_task(job())
 
 
 def price_prompt_keyboard() -> InlineKeyboardMarkup:
@@ -494,7 +552,8 @@ async def show_payment_menu(context, user_id: int, order_id: int):
 HELP_ADMIN = (
     "📮 <b>发布售卖机器人</b>\n\n"
     "<b>发布内容：</b>\n"
-    "发 /post → 发送图片/视频/文字 → 设价格或点「无价发布」\n\n"
+    "发 /post → 发送图片/视频/文字 → 设价格或点「无价发布」\n"
+    "（可一次选多张图作为相册，最多10张）\n\n"
     "<b>售卖流程：</b>\n"
     "设三个缅币价格 → 带购买按钮发布\n\n"
     "<b>命令：</b>\n"
@@ -662,7 +721,7 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         "📝 <b>发布模式</b>\n\n"
         "请发送要发布的内容：\n"
-        "• 图片 / 视频\n"
+        "• 图片 / 视频（可一次选多张，最多10张）\n"
         "• 或纯文字（热情的话、通知等）\n\n"
         "发送后可选设价格，或点「无价发布」",
         parse_mode="HTML",
@@ -696,6 +755,19 @@ async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info("post draft user=%s step=%s", user.id, step)
 
         if step == "await_content":
+            # 多图相册：Telegram 会分多条消息发送
+            if msg.media_group_id:
+                media_type, file_id = extract_media(msg)
+                if media_type:
+                    key = _album_key(user.id, msg.media_group_id)
+                    if key not in _album_buffer:
+                        _album_buffer[key] = {"items": [], "caption": ""}
+                    _album_buffer[key]["items"].append({"type": media_type, "file_id": file_id})
+                    if msg.caption:
+                        _album_buffer[key]["caption"] = msg.caption
+                    await _schedule_album_finalize(context, user.id, msg.media_group_id, msg.chat_id)
+                return
+
             media_type, file_id = extract_media(msg)
             if media_type:
                 caption = msg.caption or ""
