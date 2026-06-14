@@ -35,7 +35,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("postbot")
 
-TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAElwCm7-DdHEYcKoByEMTjMxtZDTmnOpKE")
+TOKEN = os.environ.get("POSTBOT_TOKEN", "8819236422:AAHwAyMcmKJQTjqbnLCrzyjqGxG_FEnW7pg")
 MASTER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
 PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.environ.get("POSTBOT_DB", "postbot_data.db")
@@ -51,9 +51,8 @@ DEFAULT_PAY = {
 
 flask_app = Flask(__name__)
 
-# 多图相册暂存（Telegram 相册会分多条消息到达）
-_album_buffer: dict[tuple[int, str], dict] = {}
-_album_tasks: dict[tuple[int, str], asyncio.Task] = {}
+# 多图收集：等所有图片到齐再进入设价（防抖 2.5 秒）
+_content_tasks: dict[int, asyncio.Task] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -109,13 +108,27 @@ def init_db():
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v)
             )
+        _migrate_db(conn)
+
+
+def _migrate_db(conn):
+    listing_cols = {r[1] for r in conn.execute("PRAGMA table_info(listings)").fetchall()}
+    if "price_mode" not in listing_cols:
+        conn.execute("ALTER TABLE listings ADD COLUMN price_mode TEXT DEFAULT 'qty'")
+    if "prices_json" not in listing_cols:
+        conn.execute("ALTER TABLE listings ADD COLUMN prices_json TEXT")
+    draft_cols = {r[1] for r in conn.execute("PRAGMA table_info(admin_drafts)").fetchall()}
+    if "price_mode" not in draft_cols:
+        conn.execute("ALTER TABLE admin_drafts ADD COLUMN price_mode TEXT DEFAULT 'qty'")
+    if "prices_json" not in draft_cols:
+        conn.execute("ALTER TABLE admin_drafts ADD COLUMN prices_json TEXT")
 
 
 def db_get_draft(user_id: int) -> dict | None:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT step, media_type, file_id, caption, price1, price2, price3, no_price "
-            "FROM admin_drafts WHERE user_id=?", (user_id,),
+            "SELECT step, media_type, file_id, caption, price1, price2, price3, no_price, "
+            "price_mode, prices_json FROM admin_drafts WHERE user_id=?", (user_id,),
         ).fetchone()
     if not row:
         return None
@@ -133,19 +146,42 @@ def db_get_draft(user_id: int) -> dict | None:
     if row[6] is not None:
         draft["price3"] = row[6]
     draft["no_price"] = bool(row[7])
+    if len(row) > 8 and row[8]:
+        draft["price_mode"] = row[8]
+    if len(row) > 9 and row[9]:
+        draft["prices_json"] = row[9]
+        try:
+            draft["work_prices"] = json.loads(row[9])
+        except json.JSONDecodeError:
+            draft["work_prices"] = []
+    if row[1] == "collecting" and row[2]:
+        try:
+            draft["items"] = json.loads(row[2])
+        except json.JSONDecodeError:
+            draft["items"] = []
     return draft
 
 
 def db_save_draft(user_id: int, draft: dict):
+    media_type = draft.get("media_type")
+    file_id = draft.get("file_id")
+    if "items" in draft:
+        media_type = "collecting"
+        file_id = json.dumps(draft["items"])
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """INSERT OR REPLACE INTO admin_drafts
-               (user_id, step, media_type, file_id, caption, price1, price2, price3, no_price)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (user_id, step, media_type, file_id, caption, price1, price2, price3, no_price,
+                price_mode, prices_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                user_id, draft.get("step"), draft.get("media_type"), draft.get("file_id"),
+                user_id, draft.get("step"), media_type, file_id,
                 draft.get("caption"), draft.get("price1"), draft.get("price2"), draft.get("price3"),
                 1 if draft.get("no_price") else 0,
+                draft.get("price_mode", "qty"),
+                draft.get("prices_json") or (
+                    json.dumps(draft["work_prices"]) if draft.get("work_prices") else None
+                ),
             ),
         )
 
@@ -203,11 +239,14 @@ def db_get_default(user_id: int) -> int | None:
     return row[0] if row else None
 
 
-def db_create_listing(media_type, file_id, caption, p1, p2, p3) -> int:
+def db_create_listing(media_type, file_id, caption, p1, p2, p3,
+                      price_mode="qty", prices_json=None) -> int:
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "INSERT INTO listings (media_type,file_id,caption,price1,price2,price3,created_at) VALUES (?,?,?,?,?,?,?)",
-            (media_type, file_id, caption or "", p1, p2, p3, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            "INSERT INTO listings (media_type,file_id,caption,price1,price2,price3,created_at,"
+            "price_mode,prices_json) VALUES (?,?,?,?,?,?,?,?,?)",
+            (media_type, file_id, caption or "", p1, p2, p3,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), price_mode, prices_json),
         )
         return cur.lastrowid
 
@@ -215,10 +254,16 @@ def db_create_listing(media_type, file_id, caption, p1, p2, p3) -> int:
 def db_get_listing(lid: int) -> dict | None:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute("SELECT * FROM listings WHERE id=?", (lid,)).fetchone()
-    if not row:
-        return None
-    cols = ["id", "media_type", "file_id", "caption", "price1", "price2", "price3", "created_at"]
-    return dict(zip(cols, row))
+        if not row:
+            return None
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(listings)").fetchall()]
+        listing = dict(zip(cols, row))
+        if listing.get("prices_json"):
+            try:
+                listing["work_prices"] = json.loads(listing["prices_json"])
+            except json.JSONDecodeError:
+                listing["work_prices"] = []
+        return listing
 
 
 def db_create_order(listing_id, buyer_id, buyer_name, qty, price) -> int:
@@ -291,10 +336,40 @@ def forward_chat(message):
 
 
 def parse_prices(text: str) -> tuple[float, float, float] | None:
-    nums = re.findall(r"\d+(?:\.\d+)?", text.replace(",", " "))
-    if len(nums) >= 3:
-        return float(nums[0]), float(nums[1]), float(nums[2])
+    nums = parse_price_list(text, 3)
+    if nums and len(nums) >= 3:
+        return nums[0], nums[1], nums[2]
     return None
+
+
+def parse_price_list(text: str, count: int | None = None) -> list[float] | None:
+    nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", text.replace(",", " "))]
+    if count is not None:
+        return nums if len(nums) == count else None
+    return nums if nums else None
+
+
+def listing_qty_price(listing: dict, qty: int) -> float | None:
+    if listing.get("price_mode") == "works":
+        prices = listing.get("work_prices") or []
+        if not prices and listing.get("prices_json"):
+            try:
+                prices = json.loads(listing["prices_json"])
+            except json.JSONDecodeError:
+                prices = []
+        if 1 <= qty <= len(prices):
+            return prices[qty - 1]
+        return None
+    return {1: listing["price1"], 2: listing["price2"], 3: listing["price3"]}.get(qty)
+
+
+def draft_work_count(draft: dict) -> int:
+    if draft.get("media_type") == "album":
+        try:
+            return len(json.loads(draft.get("file_id") or "[]"))
+        except json.JSONDecodeError:
+            return 0
+    return 1
 
 
 def extract_media(message):
@@ -315,10 +390,36 @@ def extract_media(message):
 
 def price_buttons(listing_id: int, p1: float, p2: float, p3: float) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🛒 买1个 — {p1}", callback_data=f"buy:{listing_id}:1")],
-        [InlineKeyboardButton(f"🛒 买2个 — {p2}", callback_data=f"buy:{listing_id}:2")],
-        [InlineKeyboardButton(f"🛒 买3个 — {p3}", callback_data=f"buy:{listing_id}:3")],
+        [InlineKeyboardButton(f"🛒 买1个 — {p1:g}", callback_data=f"buy:{listing_id}:1")],
+        [InlineKeyboardButton(f"🛒 买2个 — {p2:g}", callback_data=f"buy:{listing_id}:2")],
+        [InlineKeyboardButton(f"🛒 买3个 — {p3:g}", callback_data=f"buy:{listing_id}:3")],
     ])
+
+
+def work_buttons(listing_id: int, prices: list[float]) -> InlineKeyboardMarkup:
+    rows = []
+    for i, p in enumerate(prices, 1):
+        rows.append([
+            InlineKeyboardButton(
+                f"🛒 {i}号作品 — {p:g}",
+                callback_data=f"buy:{listing_id}:{i}",
+            )
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def listing_keyboard(listing: dict) -> InlineKeyboardMarkup | None:
+    if listing.get("price_mode") == "works":
+        prices = listing.get("work_prices") or []
+        if not prices and listing.get("prices_json"):
+            try:
+                prices = json.loads(listing["prices_json"])
+            except json.JSONDecodeError:
+                prices = []
+        if prices:
+            return work_buttons(listing["id"], prices)
+        return None
+    return price_buttons(listing["id"], listing["price1"], listing["price2"], listing["price3"])
 
 
 def pay_buttons(order_id: int) -> InlineKeyboardMarkup:
@@ -415,7 +516,7 @@ async def verify_and_bind(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 async def send_listing_to_chat(context, chat_id: int, listing: dict) -> bool:
-    kb = price_buttons(listing["id"], listing["price1"], listing["price2"], listing["price3"])
+    kb = listing_keyboard(listing)
     return await _send_media(context, chat_id, listing["media_type"], listing["file_id"],
                              listing["caption"] or "🛍 精选作品", kb)
 
@@ -453,44 +554,70 @@ async def _send_media(context, chat_id, media_type, file_id, caption, reply_mark
         return False
 
 
-def _album_key(user_id: int, media_group_id) -> tuple[int, str]:
-    return user_id, str(media_group_id)
+def _get_draft_items(draft: dict) -> list:
+    items = draft.get("items")
+    if items is not None:
+        return items
+    if draft.get("media_type") == "collecting" and draft.get("file_id"):
+        try:
+            return json.loads(draft["file_id"])
+        except json.JSONDecodeError:
+            return []
+    return []
 
 
-async def _schedule_album_finalize(context, user_id: int, media_group_id, chat_id: int):
-    key = _album_key(user_id, media_group_id)
-    old = _album_tasks.get(key)
+async def _finalize_content(context, user_id: int, chat_id: int):
+    _content_tasks.pop(user_id, None)
+    draft = db_get_draft(user_id)
+    if not draft or draft.get("step") != "await_content":
+        return
+    items = _get_draft_items(draft)
+    if not items:
+        return
+    caption = draft.get("caption") or ""
+    if len(items) == 1:
+        draft.update({"media_type": items[0]["type"], "file_id": items[0]["file_id"], "price_mode": "qty"})
+    else:
+        draft.update({"media_type": "album", "file_id": json.dumps(items), "price_mode": "works"})
+    draft["caption"] = caption
+    draft["step"] = "await_prices"
+    if "items" in draft:
+        del draft["items"]
+    db_save_draft(user_id, draft)
+    n = len(items)
+    if draft.get("price_mode") == "works":
+        price_hint = (
+            f"📸 收到 {n} 个作品！\n\n"
+            f"请为每个作品设价格（共 {n} 个，缅币），例如：\n"
+            f"<code>{', '.join(['400000'] * min(n, 3))}{'...' if n > 3 else ''}</code>\n\n"
+            f"发布后按钮显示：1号作品、2号作品…\n"
+            f"或点「无价发布」："
+        )
+    else:
+        price_hint = (
+            "📸 收到内容！\n\n"
+            "请发三个价格（买1个/买2个/买3个），例如：\n"
+            "<code>400000, 750000, 1000000</code>\n\n"
+            "或点「无价发布」："
+        )
+    await context.bot.send_message(
+        chat_id, price_hint, parse_mode="HTML", reply_markup=price_prompt_keyboard(),
+    )
+
+
+async def _schedule_content_finalize(context, user_id: int, chat_id: int):
+    old = _content_tasks.get(user_id)
     if old and not old.done():
         old.cancel()
 
     async def job():
-        await asyncio.sleep(1.0)
-        data = _album_buffer.pop(key, None)
-        _album_tasks.pop(key, None)
-        if not data or not data.get("items"):
-            return
-        draft = db_get_draft(user_id)
-        if not draft or draft.get("step") != "await_content":
-            return
-        draft.update({
-            "media_type": "album",
-            "file_id": json.dumps(data["items"]),
-            "caption": data.get("caption") or "",
-            "step": "await_prices",
-        })
-        db_save_draft(user_id, draft)
-        n = len(data["items"])
-        await context.bot.send_message(
-            chat_id,
-            f"📸 收到 {n} 张图片！\n\n"
-            "请发送三个价格（缅币），例如：\n"
-            "<code>400000, 750000, 1000000</code>\n\n"
-            "或点「无价发布」：",
-            parse_mode="HTML",
-            reply_markup=price_prompt_keyboard(),
-        )
+        try:
+            await asyncio.sleep(2.5)
+            await _finalize_content(context, user_id, chat_id)
+        except asyncio.CancelledError:
+            pass
 
-    _album_tasks[key] = asyncio.create_task(job())
+    _content_tasks[user_id] = asyncio.create_task(job())
 
 
 def price_prompt_keyboard() -> InlineKeyboardMarkup:
@@ -500,15 +627,23 @@ def price_prompt_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-async def ask_prices(update: Update):
-    await update.message.reply_text(
-        "📸 收到内容！\n\n"
-        "请发送三个价格（缅币，买1/2/3个），例如：\n"
-        "<code>400000, 750000, 1000000</code>\n\n"
-        "或点击下方按钮，无价发布（不带购买按钮）：",
-        parse_mode="HTML",
-        reply_markup=price_prompt_keyboard(),
-    )
+async def ask_prices(update: Update, draft: dict | None = None):
+    if draft and draft.get("price_mode") == "works":
+        n = draft_work_count(draft)
+        text = (
+            f"📸 收到 {n} 个作品！\n\n"
+            f"请为每个作品设价格（共 {n} 个），例如：\n"
+            f"<code>{', '.join(['400000'] * min(n, 3))}</code>\n\n"
+            f"或点「无价发布」："
+        )
+    else:
+        text = (
+            "📸 收到内容！\n\n"
+            "请发三个价格（买1个/买2个/买3个），例如：\n"
+            "<code>400000, 750000, 1000000</code>\n\n"
+            "或点「无价发布」："
+        )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=price_prompt_keyboard())
 
 
 async def finish_publish(context, uid: int, target_id: int, draft: dict) -> tuple[bool, str]:
@@ -516,16 +651,35 @@ async def finish_publish(context, uid: int, target_id: int, draft: dict) -> tupl
         ok = await send_draft_to_chat(context, target_id, draft)
         msg = "✅ 已无价发布" if ok else "❌ 发布失败"
     else:
-        lid = db_create_listing(
-            draft["media_type"], draft.get("file_id", ""), draft.get("caption", ""),
-            draft["price1"], draft["price2"], draft["price3"],
-        )
+        price_mode = draft.get("price_mode", "qty")
+        if price_mode == "works":
+            work_prices = draft.get("work_prices") or []
+            if not work_prices and draft.get("prices_json"):
+                try:
+                    work_prices = json.loads(draft["prices_json"])
+                except json.JSONDecodeError:
+                    work_prices = []
+            p1 = work_prices[0] if work_prices else 0
+            p2 = work_prices[1] if len(work_prices) > 1 else 0
+            p3 = work_prices[2] if len(work_prices) > 2 else 0
+            prices_json = json.dumps(work_prices)
+            lid = db_create_listing(
+                draft["media_type"], draft.get("file_id", ""), draft.get("caption", ""),
+                p1, p2, p3, price_mode="works", prices_json=prices_json,
+            )
+            price_str = " / ".join(f"{i}号:{p:g}" for i, p in enumerate(work_prices, 1))
+        else:
+            lid = db_create_listing(
+                draft["media_type"], draft.get("file_id", ""), draft.get("caption", ""),
+                draft["price1"], draft["price2"], draft["price3"],
+            )
+            price_str = f"{draft['price1']}/{draft['price2']}/{draft['price3']}"
         listing = db_get_listing(lid)
         ok = await send_listing_to_chat(context, target_id, listing)
         msg = (
             f"{'✅ 已发布' if ok else '❌ 发布失败'}\n"
             f"商品ID：{lid}\n"
-            f"价格：{draft['price1']}/{draft['price2']}/{draft['price3']}"
+            f"价格：{price_str}"
         )
     db_clear_draft(uid)
     return ok, msg
@@ -536,9 +690,14 @@ async def show_payment_menu(context, user_id: int, order_id: int):
     if not order:
         await context.bot.send_message(user_id, "订单不存在或已过期。")
         return
+    listing = db_get_listing(order["listing_id"])
+    if listing and listing.get("price_mode") == "works":
+        qty_label = f"{order['qty']}号作品"
+    else:
+        qty_label = f"{order['qty']} 个"
     text = (
         f"🛍 <b>确认订单 #{order_id}</b>\n"
-        f"数量：{order['qty']} 个\n"
+        f"{qty_label}\n"
         f"金额：<b>{format_mmk(order['price'])}</b> 缅币\n"
         f"（选 USDT 按 ÷{int(get_usdt_rate())} 换算）\n\n"
         f"请选择支付方式："
@@ -555,9 +714,11 @@ HELP_ADMIN = (
     "发 /post → 发送图片/视频/文字 → 设价格或点「无价发布」\n"
     "（可一次选多张图作为相册，最多10张）\n\n"
     "<b>售卖流程：</b>\n"
-    "设三个缅币价格 → 带购买按钮发布\n\n"
+    "单张图：设买1/2/3个的价格\n"
+    "多张图：每个作品单独设价（1号作品、2号作品…）\n\n"
     "<b>命令：</b>\n"
     "/post — 开始发布\n"
+    "/done — 多图发完确认\n"
     "/setpay — 收款信息\n"
     "/targets — 已绑定群/频道\n"
     "/default — 默认发布目标\n"
@@ -723,9 +884,24 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "请发送要发布的内容：\n"
         "• 图片 / 视频（可一次选多张，最多10张）\n"
         "• 或纯文字（热情的话、通知等）\n\n"
+        "多张图可一次选相册，或逐张发，发完输入 /done\n\n"
         "发送后可选设价格，或点「无价发布」",
         parse_mode="HTML",
     )
+
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_master(update.effective_user.id):
+        return
+    uid = update.effective_user.id
+    draft = db_get_draft(uid)
+    if not draft or draft.get("step") != "await_content" or not _get_draft_items(draft):
+        await reply(update, "当前没有待发布的图片。请先 /post 再发图。")
+        return
+    old = _content_tasks.pop(uid, None)
+    if old and not old.done():
+        old.cancel()
+    await _finalize_content(context, uid, update.effective_chat.id)
 
 
 # ---------------------------------------------------------------------------
@@ -755,34 +931,35 @@ async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info("post draft user=%s step=%s", user.id, step)
 
         if step == "await_content":
-            # 多图相册：Telegram 会分多条消息发送
-            if msg.media_group_id:
-                media_type, file_id = extract_media(msg)
-                if media_type:
-                    key = _album_key(user.id, msg.media_group_id)
-                    if key not in _album_buffer:
-                        _album_buffer[key] = {"items": [], "caption": ""}
-                    _album_buffer[key]["items"].append({"type": media_type, "file_id": file_id})
-                    if msg.caption:
-                        _album_buffer[key]["caption"] = msg.caption
-                    await _schedule_album_finalize(context, user.id, msg.media_group_id, msg.chat_id)
-                return
-
             media_type, file_id = extract_media(msg)
             if media_type:
                 caption = msg.caption or ""
                 src = forward_chat(msg)
                 if not caption and src:
                     caption = src.title or ""
-                draft.update({"media_type": media_type, "file_id": file_id, "caption": caption})
+                items = _get_draft_items(draft)
+                if not any(x["file_id"] == file_id for x in items):
+                    items.append({"type": media_type, "file_id": file_id})
+                draft["items"] = items
+                if caption:
+                    draft["caption"] = caption
+                db_save_draft(user.id, draft)
+                await _schedule_content_finalize(context, user.id, msg.chat_id)
+                await msg.reply_text(
+                    f"✅ 已收到 {len(items)} 张\n"
+                    f"继续发图，或发 /done 完成"
+                )
+                return
             elif msg.text and not msg.text.startswith("/"):
-                draft.update({"media_type": "text", "file_id": "", "caption": msg.text})
+                draft.update({
+                    "media_type": "text", "file_id": "", "caption": msg.text, "price_mode": "qty",
+                })
             else:
                 await msg.reply_text("请发送图片、视频或文字。")
                 return
             draft["step"] = "await_prices"
             db_save_draft(user.id, draft)
-            await ask_prices(update)
+            await ask_prices(update, draft)
             return
 
         if step == "await_prices" and msg.text and not msg.text.startswith("/"):
@@ -803,15 +980,35 @@ async def on_admin_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not draft or draft.get("step") != "await_prices":
         return
 
-    prices = parse_prices(update.message.text)
-    if not prices:
-        await update.message.reply_text(
-            "❌ 格式不对，请发三个数字，例如：400000, 750000, 1000000\n"
-            "或点「无价发布」按钮",
-        )
-        return
+    price_mode = draft.get("price_mode", "qty")
+    if price_mode == "works":
+        n = draft_work_count(draft)
+        prices = parse_price_list(update.message.text, n)
+        if not prices:
+            await update.message.reply_text(
+                f"❌ 格式不对，请发 {n} 个价格（每个作品一个），例如：\n"
+                f"<code>{', '.join(['400000'] * min(n, 3))}</code>\n"
+                f"或点「无价发布」按钮",
+                parse_mode="HTML",
+            )
+            return
+        draft["work_prices"] = prices
+        draft["prices_json"] = json.dumps(prices)
+        draft["price1"] = prices[0]
+        draft["price2"] = prices[1] if len(prices) > 1 else 0
+        draft["price3"] = prices[2] if len(prices) > 2 else 0
+        price_summary = " / ".join(f"{i}号:{p:g}" for i, p in enumerate(prices, 1))
+    else:
+        prices = parse_prices(update.message.text)
+        if not prices:
+            await update.message.reply_text(
+                "❌ 格式不对，请发三个数字，例如：400000, 750000, 1000000\n"
+                "或点「无价发布」按钮",
+            )
+            return
+        draft["price1"], draft["price2"], draft["price3"] = prices
+        price_summary = f"{prices[0]} / {prices[1]} / {prices[2]}"
 
-    draft["price1"], draft["price2"], draft["price3"] = prices
     draft["no_price"] = False
     draft["step"] = "pick_target"
     db_save_draft(uid, draft)
@@ -829,7 +1026,7 @@ async def on_admin_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"价格：{prices[0]} / {prices[1]} / {prices[2]}\n\n请选择发布到哪里：",
+        f"价格：{price_summary}\n\n请选择发布到哪里：",
         reply_markup=build_target_keyboard(targets, "pick"),
     )
 
@@ -842,12 +1039,12 @@ async def start_buy_flow(context, user, listing_id: int, qty: int):
     if not listing:
         await context.bot.send_message(user.id, "商品不存在或已下架。")
         return
-    price_map = {1: listing["price1"], 2: listing["price2"], 3: listing["price3"]}
-    if qty not in price_map:
-        await context.bot.send_message(user.id, "无效的数量。")
+    price = listing_qty_price(listing, qty)
+    if price is None:
+        await context.bot.send_message(user.id, "无效选项。")
         return
     name = user.full_name or user.username or str(user.id)
-    oid = db_create_order(listing_id, user.id, name, qty, price_map[qty])
+    oid = db_create_order(listing_id, user.id, name, qty, price)
     await show_payment_menu(context, user.id, oid)
 
 
@@ -862,9 +1059,8 @@ async def on_buy_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("商品已下架", show_alert=True)
         return
 
-    price_map = {1: listing["price1"], 2: listing["price2"], 3: listing["price3"]}
-    price = price_map.get(qty)
-    if not price:
+    price = listing_qty_price(listing, qty)
+    if price is None:
         await query.answer("无效选项", show_alert=True)
         return
 
@@ -1161,7 +1357,7 @@ def create_app() -> Application:
 
     for cmd, handler in [
         ("start", cmd_start), ("help", cmd_help), ("ping", cmd_ping), ("id", cmd_id),
-        ("post", cmd_post), ("bind", cmd_bind), ("unbind", cmd_unbind),
+        ("post", cmd_post), ("done", cmd_done), ("bind", cmd_bind), ("unbind", cmd_unbind),
         ("targets", cmd_targets), ("default", cmd_default), ("setpay", cmd_setpay),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
