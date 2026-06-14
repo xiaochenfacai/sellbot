@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("postbot")
 
-TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAEjyiqUZTJck25mzMhwIbv9y3AYPQ99TzI")
+TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAGCDTj4d58wyXZ1fyL-wpQNrZMVqN6Fiz0")
 MASTER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
 PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.environ.get("POSTBOT_DB", "postbot_data.db")
@@ -216,7 +216,9 @@ def db_get_buyer_session(user_id: int) -> dict | None:
 # 工具
 # ---------------------------------------------------------------------------
 def is_master(user_id: int | None) -> bool:
-    return user_id == MASTER_ID
+    if user_id is None:
+        return False
+    return int(user_id) == int(MASTER_ID)
 
 
 async def reply(update: Update, text: str, **kwargs):
@@ -559,30 +561,71 @@ async def cmd_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # 管理员发作品 + 设价格
 # ---------------------------------------------------------------------------
-async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or not is_master(update.effective_user.id):
+async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """管理员私聊统一入口：发图、设价、转发绑定"""
+    if update.effective_chat.type != "private":
         return
-    media_type, file_id = extract_media(update.message)
-    if not media_type:
-        await update.message.reply_text("❌ 请发送图片或视频。")
+    user = update.effective_user
+    if not is_master(user.id if user else None):
         return
-    caption = update.message.caption or ""
-    if not caption and update.message.forward_from_chat:
-        caption = update.message.forward_from_chat.title or ""
-    _admin_drafts[update.effective_user.id] = {
-        "media_type": media_type,
-        "file_id": file_id,
-        "caption": caption,
-    }
-    await update.message.reply_text(
-        "📸 收到作品！\n\n"
-        "请发送三个价格（买1个 / 买2个 / 买3个），单位为缅币：\n\n"
-        "例如：\n"
-        "<code>400000, 750000, 1000000</code>\n"
-        "或：\n"
-        "<code>1=400000\n2=750000\n3=1000000</code>",
-        parse_mode="HTML",
+
+    msg = update.message
+    if not msg:
+        return
+
+    log.info(
+        "管理员消息 photo=%s video=%s doc=%s forward=%s",
+        bool(msg.photo), bool(msg.video), bool(msg.document), bool(msg.forward_date),
     )
+
+    # 1. 图片/视频 → 发作品
+    media_type, _ = extract_media(msg)
+    if media_type:
+        await on_admin_photo(update, context)
+        return
+
+    # 2. 有草稿 → 输入价格
+    if msg.text and not msg.text.startswith("/"):
+        if _admin_drafts.get(user.id):
+            await on_admin_prices(update, context)
+            return
+        await msg.reply_text("请先发送图片或视频，再发三个价格（缅币）。")
+        return
+
+    # 3. 转发纯文字 → 绑定群/频道
+    source = forward_chat(msg)
+    if source and source.type in ("channel", "group", "supergroup"):
+        await verify_and_bind(update, context, source.id, source.title or str(source.id), source.type)
+        return
+
+
+async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if update.effective_chat.type != "private" or not is_master(update.effective_user.id):
+            return
+        media_type, file_id = extract_media(update.message)
+        if not media_type:
+            await update.message.reply_text("❌ 请发送图片或视频。")
+            return
+        caption = update.message.caption or ""
+        src = forward_chat(update.message)
+        if not caption and src:
+            caption = src.title or ""
+        _admin_drafts[update.effective_user.id] = {
+            "media_type": media_type,
+            "file_id": file_id,
+            "caption": caption,
+        }
+        await update.message.reply_text(
+            "📸 收到作品！\n\n"
+            "请发送三个价格（买1个 / 买2个 / 买3个），单位为缅币：\n\n"
+            "例如：\n"
+            "<code>400000, 750000, 1000000</code>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        log.exception("发作品失败")
+        await update.message.reply_text(f"❌ 处理失败：{e}")
 
 
 async def on_admin_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -871,21 +914,6 @@ async def on_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await on_admin_callback(update, context)
 
 
-async def on_forward_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or not is_master(update.effective_user.id):
-        return
-
-    # 转发的图片/视频 → 发作品，不是绑定群
-    if extract_media(update.message)[0]:
-        await on_admin_photo(update, context)
-        return
-
-    source = forward_chat(update.message)
-    if not source or source.type not in ("channel", "group", "supergroup"):
-        return
-    await verify_and_bind(update, context, source.id, source.title or str(source.id), source.type)
-
-
 async def on_bot_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.my_chat_member
     if not m or m.new_chat_member.status not in ("administrator", "member"):
@@ -936,22 +964,9 @@ def create_app() -> Application:
 
     app.add_handler(CallbackQueryHandler(on_callback_router))
 
-    # 买家消息优先处理（必须在管理员图片处理器之前）
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & ~filters.COMMAND,
-        on_buyer_message,
-        block=False,
-    ))
-
-    admin_only = filters.ChatType.PRIVATE & filters.User(user_id=MASTER_ID)
-    admin_media = admin_only & (
-        filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.IMAGE
-    )
-
-    # 管理员发/转发作品（必须在 forward_bind 之前）
-    app.add_handler(MessageHandler(admin_media, on_admin_photo))
-    app.add_handler(MessageHandler(admin_only & filters.FORWARDED, on_forward_bind))
-    app.add_handler(MessageHandler(admin_only & filters.TEXT & ~filters.COMMAND, on_admin_prices))
+    private_msg = filters.ChatType.PRIVATE & ~filters.COMMAND
+    app.add_handler(MessageHandler(private_msg, on_buyer_message, block=False))
+    app.add_handler(MessageHandler(private_msg, on_admin_private))
     return app
 
 
