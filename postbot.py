@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("postbot")
 
-TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAF815WT-9G5mrD24eYnTl5TgNT2iTjZ75E")
+TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAFeUWIUfOmK31XDahQq290xE-l4bk5CPU4")
 MASTER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
 PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.environ.get("POSTBOT_DB", "postbot_data.db")
@@ -48,7 +48,6 @@ DEFAULT_PAY = {
 }
 
 flask_app = Flask(__name__)
-_admin_drafts: dict[int, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +92,61 @@ def init_db():
                 user_id INTEGER PRIMARY KEY, order_id INTEGER, step TEXT
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS admin_drafts (
+                user_id INTEGER PRIMARY KEY,
+                step TEXT, media_type TEXT, file_id TEXT, caption TEXT,
+                price1 REAL, price2 REAL, price3 REAL, no_price INTEGER DEFAULT 0
+            )"""
+        )
         for k, v in DEFAULT_PAY.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v)
             )
+
+
+def db_get_draft(user_id: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT step, media_type, file_id, caption, price1, price2, price3, no_price "
+            "FROM admin_drafts WHERE user_id=?", (user_id,),
+        ).fetchone()
+    if not row:
+        return None
+    draft: dict = {"step": row[0]}
+    if row[1]:
+        draft["media_type"] = row[1]
+    if row[2]:
+        draft["file_id"] = row[2]
+    if row[3]:
+        draft["caption"] = row[3]
+    if row[4] is not None:
+        draft["price1"] = row[4]
+    if row[5] is not None:
+        draft["price2"] = row[5]
+    if row[6] is not None:
+        draft["price3"] = row[6]
+    draft["no_price"] = bool(row[7])
+    return draft
+
+
+def db_save_draft(user_id: int, draft: dict):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO admin_drafts
+               (user_id, step, media_type, file_id, caption, price1, price2, price3, no_price)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                user_id, draft.get("step"), draft.get("media_type"), draft.get("file_id"),
+                draft.get("caption"), draft.get("price1"), draft.get("price2"), draft.get("price3"),
+                1 if draft.get("no_price") else 0,
+            ),
+        )
+
+
+def db_clear_draft(user_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM admin_drafts WHERE user_id=?", (user_id,))
 
 
 def db_get_setting(key: str) -> str:
@@ -421,7 +471,7 @@ async def finish_publish(context, uid: int, target_id: int, draft: dict) -> tupl
             f"商品ID：{lid}\n"
             f"价格：{draft['price1']}/{draft['price2']}/{draft['price3']}"
         )
-    _admin_drafts.pop(uid, None)
+    db_clear_draft(uid)
     return ok, msg
 
 
@@ -609,7 +659,7 @@ async def cmd_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_master(update.effective_user.id):
         return
-    _admin_drafts[update.effective_user.id] = {"step": "await_content"}
+    db_save_draft(update.effective_user.id, {"step": "await_content"})
     await reply(
         update,
         "📝 <b>发布模式</b>\n\n"
@@ -636,42 +686,50 @@ async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    draft = _admin_drafts.get(user.id)
-    if not draft:
-        source = forward_chat(msg)
-        if source and source.type in ("channel", "group", "supergroup"):
-            await verify_and_bind(update, context, source.id, source.title or str(source.id), source.type)
-        return
-
-    step = draft.get("step")
-
-    if step == "await_content":
-        media_type, file_id = extract_media(msg)
-        if media_type:
-            caption = msg.caption or ""
-            src = forward_chat(msg)
-            if not caption and src:
-                caption = src.title or ""
-            draft.update({"media_type": media_type, "file_id": file_id, "caption": caption})
-        elif msg.text and not msg.text.startswith("/"):
-            draft.update({"media_type": "text", "file_id": "", "caption": msg.text})
-        else:
-            await msg.reply_text("请发送图片、视频或文字。")
+    try:
+        draft = db_get_draft(user.id)
+        if not draft:
+            source = forward_chat(msg)
+            if source and source.type in ("channel", "group", "supergroup"):
+                await verify_and_bind(update, context, source.id, source.title or str(source.id), source.type)
             return
-        draft["step"] = "await_prices"
-        await ask_prices(update)
-        return
 
-    if step == "await_prices" and msg.text and not msg.text.startswith("/"):
-        await on_admin_prices(update, context)
-        return
+        step = draft.get("step")
+        log.info("post draft user=%s step=%s", user.id, step)
+
+        if step == "await_content":
+            media_type, file_id = extract_media(msg)
+            if media_type:
+                caption = msg.caption or ""
+                src = forward_chat(msg)
+                if not caption and src:
+                    caption = src.title or ""
+                draft.update({"media_type": media_type, "file_id": file_id, "caption": caption})
+            elif msg.text and not msg.text.startswith("/"):
+                draft.update({"media_type": "text", "file_id": "", "caption": msg.text})
+            else:
+                await msg.reply_text("请发送图片、视频或文字。")
+                return
+            draft["step"] = "await_prices"
+            db_save_draft(user.id, draft)
+            await ask_prices(update)
+            return
+
+        if step == "await_prices" and msg.text and not msg.text.startswith("/"):
+            await on_admin_prices(update, context)
+            return
+
+    except Exception as e:
+        log.exception("管理员私聊处理失败")
+        await msg.reply_text(f"❌ 处理失败：{e}\n\n请重新发 /post")
+        db_clear_draft(user.id)
 
 
 async def on_admin_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or not is_master(update.effective_user.id):
         return
     uid = update.effective_user.id
-    draft = _admin_drafts.get(uid)
+    draft = db_get_draft(uid)
     if not draft or draft.get("step") != "await_prices":
         return
 
@@ -686,11 +744,12 @@ async def on_admin_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     draft["price1"], draft["price2"], draft["price3"] = prices
     draft["no_price"] = False
     draft["step"] = "pick_target"
+    db_save_draft(uid, draft)
 
     targets = db_list_targets()
     if not targets:
         await update.message.reply_text("请先绑定群/频道（/bind）")
-        _admin_drafts.pop(uid, None)
+        db_clear_draft(uid)
         return
 
     default = db_get_default(uid)
@@ -913,9 +972,9 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "post":
-        draft = _admin_drafts.get(uid)
+        draft = db_get_draft(uid)
         if value == "cancel":
-            _admin_drafts.pop(uid, None)
+            db_clear_draft(uid)
             await query.edit_message_text("已取消发布。")
         elif value == "noprice":
             if not draft or draft.get("step") != "await_prices":
@@ -923,9 +982,10 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             draft["no_price"] = True
             draft["step"] = "pick_target"
+            db_save_draft(uid, draft)
             targets = db_list_targets()
             if not targets:
-                _admin_drafts.pop(uid, None)
+                db_clear_draft(uid)
                 await query.edit_message_text("请先绑定群/频道（/bind）")
             else:
                 default = db_get_default(uid)
@@ -941,9 +1001,9 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "pick":
-        draft = _admin_drafts.get(uid)
+        draft = db_get_draft(uid)
         if not draft or value == "cancel":
-            _admin_drafts.pop(uid, None)
+            db_clear_draft(uid)
             await query.edit_message_text("已取消发布。")
             await query.answer()
             return
@@ -953,10 +1013,9 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "sale":
-        # 兼容旧按钮
-        draft = _admin_drafts.get(uid)
+        draft = db_get_draft(uid)
         if not draft or value == "cancel":
-            _admin_drafts.pop(uid, None)
+            db_clear_draft(uid)
             await query.edit_message_text("已取消发布。")
             await query.answer()
             return
@@ -1012,6 +1071,18 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT)
 
 
+async def on_private_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    user = update.effective_user
+    if not user:
+        return
+    if is_master(user.id):
+        await on_admin_private(update, context)
+    else:
+        await on_buyer_message(update, context)
+
+
 def create_app() -> Application:
     app = Application.builder().token(TOKEN).build()
     app.add_error_handler(on_error)
@@ -1027,10 +1098,7 @@ def create_app() -> Application:
         app.add_handler(CommandHandler(cmd, handler, filters=filters.UpdateType.CHANNEL_POSTS))
 
     app.add_handler(CallbackQueryHandler(on_callback_router))
-
-    private_msg = filters.ChatType.PRIVATE & ~filters.COMMAND
-    app.add_handler(MessageHandler(private_msg, on_buyer_message, block=False))
-    app.add_handler(MessageHandler(private_msg, on_admin_private))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_private_router))
     return app
 
 
