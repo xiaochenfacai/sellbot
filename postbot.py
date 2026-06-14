@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("postbot")
 
-TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAFq3s3WlayLgCgwldWDPFZ8zhTuoJOTJsw")
+TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAGXpfw2F0gQhglzPjKkeeq_WPpG38IyHYs")
 MASTER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
 PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.environ.get("POSTBOT_DB", "postbot_data.db")
@@ -44,6 +44,7 @@ DEFAULT_PAY = {
     "kpay": os.environ.get("KPAY_PHONE", "请设置KPay手机号"),
     "wavepay": os.environ.get("WAVEPAY_PHONE", "请设置WavePay手机号"),
     "admin_username": os.environ.get("ADMIN_USERNAME", "请设置管理员用户名"),
+    "usdt_rate": os.environ.get("USDT_RATE", "4200"),
 }
 
 flask_app = Flask(__name__)
@@ -286,6 +287,38 @@ def build_target_keyboard(targets: list[dict], prefix: str) -> InlineKeyboardMar
     return InlineKeyboardMarkup(rows)
 
 
+def get_usdt_rate() -> float:
+    try:
+        return float(db_get_setting("usdt_rate") or "4200")
+    except ValueError:
+        return 4200.0
+
+
+def mmk_to_usdt(mmk: float) -> float:
+    return round(mmk / get_usdt_rate(), 2)
+
+
+def format_mmk(price: float) -> str:
+    if price == int(price):
+        return f"{int(price):,}"
+    return f"{price:g}"
+
+
+def format_pay_block(method: str, mmk_price: float) -> str:
+    mmk_str = format_mmk(mmk_price)
+    if method == "usdt":
+        rate = get_usdt_rate()
+        usdt = mmk_to_usdt(mmk_price)
+        rate_str = f"{int(rate)}" if rate == int(rate) else f"{rate:g}"
+        return (
+            f"原价：<b>{mmk_str}</b> 缅币\n"
+            f"换算：{mmk_str} ÷ {rate_str} = <b>{usdt:.2f} USDT</b>\n\n"
+            f"💰 请您支付 <b>{usdt:.2f} USDT</b>\n"
+            f"⚠️ 请注意尾数，务必支付准确金额！"
+        )
+    return f"应付金额：<b>{mmk_str}</b> 缅币"
+
+
 def pay_info(method: str) -> str:
     if method == "usdt":
         return f"💎 <b>USDT (TRC20)</b>\n<code>{db_get_setting('usdt')}</code>"
@@ -343,7 +376,8 @@ async def show_payment_menu(context, user_id: int, order_id: int):
     text = (
         f"🛍 <b>确认订单 #{order_id}</b>\n"
         f"数量：{order['qty']} 个\n"
-        f"金额：<b>{order['price']}</b>\n\n"
+        f"金额：<b>{format_mmk(order['price'])}</b> 缅币\n"
+        f"（选 USDT 按 ÷{int(get_usdt_rate())} 换算）\n\n"
         f"请选择支付方式："
     )
     await context.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=pay_buttons(order_id))
@@ -431,11 +465,13 @@ async def cmd_setpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             "当前收款设置：\n\n"
             f"USDT：<code>{db_get_setting('usdt')}</code>\n"
+            f"USDT汇率：1 USDT = {format_mmk(get_usdt_rate())} 缅币（缅币÷{int(get_usdt_rate())}）\n"
             f"KPay：<code>{db_get_setting('kpay')}</code>\n"
             f"WavePay：<code>{db_get_setting('wavepay')}</code>\n"
             f"联系账号：@{db_get_setting('admin_username').lstrip('@')}\n\n"
             "修改格式：\n"
             "/setpay usdt 你的地址\n"
+            "/setpay rate 4200\n"
             "/setpay kpay 手机号\n"
             "/setpay wavepay 手机号\n"
             "/setpay admin 你的用户名",
@@ -444,10 +480,16 @@ async def cmd_setpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     key = context.args[0].lower()
     val = " ".join(context.args[1:])
-    mapping = {"usdt": "usdt", "kpay": "kpay", "wavepay": "wavepay", "admin": "admin_username"}
+    mapping = {"usdt": "usdt", "kpay": "kpay", "wavepay": "wavepay", "admin": "admin_username", "rate": "usdt_rate"}
     if key not in mapping:
-        await reply(update, "可选：usdt / kpay / wavepay / admin")
+        await reply(update, "可选：usdt / rate / kpay / wavepay / admin")
         return
+    if key == "rate":
+        try:
+            float(val)
+        except ValueError:
+            await reply(update, "汇率请填数字，例如：/setpay rate 4200")
+            return
     db_set_setting(mapping[key], val.lstrip("@") if key == "admin" else val)
     await reply(update, f"✅ 已更新 {key}")
 
@@ -634,9 +676,10 @@ async def on_pay_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_set_buyer_session(query.from_user.id, order_id, "await_proof")
 
     info = pay_info(method)
+    pay_block = format_pay_block(method, order["price"])
     text = (
         f"{info}\n\n"
-        f"应付金额：<b>{order['price']}</b>\n\n"
+        f"{pay_block}\n\n"
         f"📌 <b>请按以下步骤操作：</b>\n"
         f"1️⃣ 完成支付\n"
         f"2️⃣ 发送 <b>支付成功截图</b>\n"
@@ -660,44 +703,62 @@ async def on_buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_set_buyer_session(update.effective_user.id, None, None)
         return
 
-    if session["step"] == "await_proof":
-        if not update.message.photo:
-            await update.message.reply_text("请先发送支付成功截图（图片）。")
+    try:
+        if session["step"] == "await_proof":
+            proof_id = None
+            if update.message.photo:
+                proof_id = update.message.photo[-1].file_id
+            elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+                proof_id = update.message.document.file_id
+
+            if not proof_id:
+                await update.message.reply_text("请先发送支付成功截图（图片）。")
+                return
+
+            db_update_order(order["id"], proof_file_id=proof_id)
+            db_set_buyer_session(update.effective_user.id, order["id"], "await_address")
+            await update.message.reply_text("✅ 已收到截图。\n\n请发送您的收货地址（文字）：")
             return
-        proof_id = update.message.photo[-1].file_id
-        db_update_order(order["id"], proof_file_id=proof_id)
-        db_set_buyer_session(update.effective_user.id, order["id"], "await_address")
-        await update.message.reply_text("✅ 已收到截图。\n\n请发送您的收货地址（文字）：")
-        return
 
-    if session["step"] == "await_address":
-        address = update.message.text
-        if not address:
-            await update.message.reply_text("请发送文字格式的收货地址。")
-            return
-        db_update_order(order["id"], address=address, status="pending_review")
-        db_set_buyer_session(update.effective_user.id, None, None)
-        proof_id = order.get("proof_file_id")
+        if session["step"] == "await_address":
+            address = update.message.text or update.message.caption
+            if not address:
+                await update.message.reply_text("请发送文字格式的收货地址。")
+                return
 
-        await update.message.reply_text("✅ 已提交！请等待管理员审核，稍后通知您结果。")
+            db_update_order(order["id"], address=address, status="pending_review")
+            db_set_buyer_session(update.effective_user.id, None, None)
 
-        method = order.get("payment_method") or "?"
-        admin_text = (
-            f"🔔 <b>新订单 #{order['id']}</b>\n\n"
-            f"买家：{order['buyer_name']} (<code>{order['buyer_id']}</code>)\n"
-            f"数量：{order['qty']} 个\n"
-            f"金额：{order['price']}\n"
-            f"支付：{method.upper()}\n"
-            f"地址：{address}\n\n"
-            f"请核对支付截图后点击："
-        )
-        await context.bot.send_message(
-            MASTER_ID, admin_text, parse_mode="HTML", reply_markup=review_buttons(order["id"])
-        )
-        await context.bot.send_photo(
-            MASTER_ID, proof_id,
-            caption=f"订单 #{order['id']} 支付截图",
-        )
+            order = db_get_order(order["id"])
+            proof_id = order.get("proof_file_id")
+
+            await update.message.reply_text("✅ 已提交！请等待管理员审核，稍后通知您结果。")
+
+            method = order.get("payment_method") or "?"
+            mmk = order["price"]
+            amount_line = f"金额：{format_mmk(mmk)} 缅币"
+            if method == "usdt":
+                amount_line += f"\nUSDT：{mmk_to_usdt(mmk):.2f} USDT（÷{int(get_usdt_rate())}）"
+            admin_text = (
+                f"🔔 <b>新订单 #{order['id']}</b>\n\n"
+                f"买家：{order['buyer_name']} (<code>{order['buyer_id']}</code>)\n"
+                f"数量：{order['qty']} 个\n"
+                f"{amount_line}\n"
+                f"支付：{method.upper()}\n"
+                f"地址：{address}\n\n"
+                f"请核对支付截图后点击："
+            )
+            await context.bot.send_message(
+                MASTER_ID, admin_text, parse_mode="HTML", reply_markup=review_buttons(order["id"])
+            )
+            if proof_id:
+                await context.bot.send_photo(
+                    MASTER_ID, proof_id,
+                    caption=f"订单 #{order['id']} 支付截图",
+                )
+    except Exception as e:
+        log.exception("买家消息处理失败")
+        await update.message.reply_text(f"提交出错，请重试或联系管理员。({e})")
 
 
 async def on_review_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -858,24 +919,19 @@ def create_app() -> Application:
         app.add_handler(CommandHandler(cmd, handler, filters=filters.UpdateType.CHANNEL_POSTS))
 
     app.add_handler(CallbackQueryHandler(on_callback_router))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.FORWARDED, on_forward_bind))
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & filters.PHOTO & ~filters.COMMAND,
-        on_admin_photo,
-    ))
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & filters.VIDEO & ~filters.COMMAND,
-        on_admin_photo,
-    ))
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-        on_admin_prices,
-        block=False,
-    ))
+
+    # 买家消息优先处理（必须在管理员图片处理器之前）
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND,
         on_buyer_message,
+        block=False,
     ))
+
+    admin_only = filters.ChatType.PRIVATE & filters.User(user_id=MASTER_ID)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.FORWARDED & admin_only, on_forward_bind))
+    app.add_handler(MessageHandler(admin_only & filters.PHOTO, on_admin_photo))
+    app.add_handler(MessageHandler(admin_only & filters.VIDEO, on_admin_photo))
+    app.add_handler(MessageHandler(admin_only & filters.TEXT & ~filters.COMMAND, on_admin_prices))
     return app
 
 
