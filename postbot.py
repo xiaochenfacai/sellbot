@@ -5,7 +5,6 @@ Telegram 发布机器人
 
 import logging
 import sqlite3
-import json
 import os
 import threading
 from datetime import datetime
@@ -19,7 +18,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from flask import Flask, request
+from flask import Flask
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -29,7 +28,6 @@ logging.basicConfig(
 # ========== 配置（部署前请修改） ==========
 TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAFozmpoGQWv9kARDd8v3rpdhYNvlGbiZbM")
 MASTER_USER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
-WEB_URL = os.environ.get("WEB_URL", "")
 PORT = int(os.environ.get("PORT", 8080))
 
 flask_app = Flask(__name__)
@@ -368,18 +366,16 @@ async def on_private_content(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _ask_target_or_publish(update, context, update.message)
 
 
-# ========== Webhook（Render 部署用） ==========
-
-@flask_app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    application.update_queue.put_nowait(update)
-    return "ok"
-
+# ========== Web 健康检查（Render 需要端口） ==========
 
 @flask_app.route("/")
 def index():
-    return "PostBot is running."
+    return "PostBot is running.", 200
+
+
+@flask_app.route("/health")
+def health():
+    return "ok", 200
 
 
 def run_flask():
@@ -388,27 +384,25 @@ def run_flask():
 
 # ========== 启动 ==========
 
-init_db()
-application = Application.builder().token(TOKEN).build()
+def build_application() -> Application:
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("bind", cmd_bind))
+    app.add_handler(CommandHandler("unbind", cmd_unbind))
+    app.add_handler(CommandHandler("targets", cmd_targets))
+    app.add_handler(CommandHandler("default", cmd_default))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(_PUBLISH_FILTER & filters.ChatType.PRIVATE, on_private_content))
+    return app
 
-application.add_handler(CommandHandler("start", cmd_start))
-application.add_handler(CommandHandler("help", cmd_help))
-application.add_handler(CommandHandler("bind", cmd_bind))
-application.add_handler(CommandHandler("unbind", cmd_unbind))
-application.add_handler(CommandHandler("targets", cmd_targets))
-application.add_handler(CommandHandler("default", cmd_default))
-application.add_handler(CallbackQueryHandler(on_callback))
-application.add_handler(MessageHandler(_PUBLISH_FILTER & filters.ChatType.PRIVATE, on_private_content))
+
+def main():
+    init_db()
+    threading.Thread(target=run_flask, daemon=True).start()
+    print(f"PostBot 启动中... (port {PORT})")
+    build_application().run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
-    if WEB_URL:
-        threading.Thread(target=run_flask, daemon=True).start()
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=TOKEN,
-            webhook_url=f"{WEB_URL}/{TOKEN}",
-        )
-    else:
-        print("本地模式：polling 运行中...")
-        application.run_polling()
+    main()
