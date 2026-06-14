@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("postbot")
 
-TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAGCDTj4d58wyXZ1fyL-wpQNrZMVqN6Fiz0")
+TOKEN = os.environ.get("POSTBOT_TOKEN", "8877964306:AAF815WT-9G5mrD24eYnTl5TgNT2iTjZ75E")
 MASTER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
 PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.environ.get("POSTBOT_DB", "postbot_data.db")
@@ -362,18 +362,67 @@ async def verify_and_bind(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def send_listing_to_chat(context, chat_id: int, listing: dict) -> bool:
     kb = price_buttons(listing["id"], listing["price1"], listing["price2"], listing["price3"])
-    cap = listing["caption"] or "🛍 精选作品"
+    return await _send_media(context, chat_id, listing["media_type"], listing["file_id"],
+                             listing["caption"] or "🛍 精选作品", kb)
+
+
+async def send_draft_to_chat(context, chat_id: int, draft: dict) -> bool:
+    cap = draft.get("caption") or ""
+    return await _send_media(context, chat_id, draft["media_type"], draft.get("file_id"), cap, None)
+
+
+async def _send_media(context, chat_id, media_type, file_id, caption, reply_markup) -> bool:
     try:
-        if listing["media_type"] == "photo":
-            await context.bot.send_photo(chat_id, listing["file_id"], caption=cap, reply_markup=kb)
-        elif listing["media_type"] == "video":
-            await context.bot.send_video(chat_id, listing["file_id"], caption=cap, reply_markup=kb)
+        if media_type == "text":
+            await context.bot.send_message(chat_id, caption or " ", reply_markup=reply_markup)
+        elif media_type == "photo":
+            await context.bot.send_photo(chat_id, file_id, caption=caption or None, reply_markup=reply_markup)
+        elif media_type == "video":
+            await context.bot.send_video(chat_id, file_id, caption=caption or None, reply_markup=reply_markup)
         else:
-            await context.bot.send_animation(chat_id, listing["file_id"], caption=cap, reply_markup=kb)
+            await context.bot.send_animation(chat_id, file_id, caption=caption or None, reply_markup=reply_markup)
         return True
     except Exception as e:
-        log.error("发布商品失败 chat=%s err=%s", chat_id, e)
+        log.error("发布失败 chat=%s err=%s", chat_id, e)
         return False
+
+
+def price_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 无价发布（纯展示）", callback_data="post:noprice")],
+        [InlineKeyboardButton("❌ 取消", callback_data="post:cancel")],
+    ])
+
+
+async def ask_prices(update: Update):
+    await update.message.reply_text(
+        "📸 收到内容！\n\n"
+        "请发送三个价格（缅币，买1/2/3个），例如：\n"
+        "<code>400000, 750000, 1000000</code>\n\n"
+        "或点击下方按钮，无价发布（不带购买按钮）：",
+        parse_mode="HTML",
+        reply_markup=price_prompt_keyboard(),
+    )
+
+
+async def finish_publish(context, uid: int, target_id: int, draft: dict) -> tuple[bool, str]:
+    if draft.get("no_price"):
+        ok = await send_draft_to_chat(context, target_id, draft)
+        msg = "✅ 已无价发布" if ok else "❌ 发布失败"
+    else:
+        lid = db_create_listing(
+            draft["media_type"], draft.get("file_id", ""), draft.get("caption", ""),
+            draft["price1"], draft["price2"], draft["price3"],
+        )
+        listing = db_get_listing(lid)
+        ok = await send_listing_to_chat(context, target_id, listing)
+        msg = (
+            f"{'✅ 已发布' if ok else '❌ 发布失败'}\n"
+            f"商品ID：{lid}\n"
+            f"价格：{draft['price1']}/{draft['price2']}/{draft['price3']}"
+        )
+    _admin_drafts.pop(uid, None)
+    return ok, msg
 
 
 async def show_payment_menu(context, user_id: int, order_id: int):
@@ -396,14 +445,13 @@ async def show_payment_menu(context, user_id: int, order_id: int):
 # ---------------------------------------------------------------------------
 HELP_ADMIN = (
     "📮 <b>发布售卖机器人</b>\n\n"
-    "<b>发作品流程：</b>\n"
-    "1. 私聊发图片/视频\n"
-    "2. 回复三个价格，例如：\n"
-    "   <code>80, 150, 220</code>\n"
-    "   （买1个/买2个/买3个）\n"
-    "3. 选择发布到群/频道\n\n"
+    "<b>发布内容：</b>\n"
+    "发 /post → 发送图片/视频/文字 → 设价格或点「无价发布」\n\n"
+    "<b>售卖流程：</b>\n"
+    "设三个缅币价格 → 带购买按钮发布\n\n"
     "<b>命令：</b>\n"
-    "/setpay — 设置收款信息\n"
+    "/post — 开始发布\n"
+    "/setpay — 收款信息\n"
     "/targets — 已绑定群/频道\n"
     "/default — 默认发布目标\n"
     "/bind /unbind /ping /id"
@@ -558,11 +606,26 @@ async def cmd_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, "选择默认发布目标：", reply_markup=build_target_keyboard(targets, "def"))
 
 
+async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_master(update.effective_user.id):
+        return
+    _admin_drafts[update.effective_user.id] = {"step": "await_content"}
+    await reply(
+        update,
+        "📝 <b>发布模式</b>\n\n"
+        "请发送要发布的内容：\n"
+        "• 图片 / 视频\n"
+        "• 或纯文字（热情的话、通知等）\n\n"
+        "发送后可选设价格，或点「无价发布」",
+        parse_mode="HTML",
+    )
+
+
 # ---------------------------------------------------------------------------
 # 管理员发作品 + 设价格
 # ---------------------------------------------------------------------------
 async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """管理员私聊统一入口：发图、设价、转发绑定"""
+    """管理员私聊：/post 流程 + 转发绑定"""
     if update.effective_chat.type != "private":
         return
     user = update.effective_user
@@ -573,59 +636,35 @@ async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    log.info(
-        "管理员消息 photo=%s video=%s doc=%s forward=%s",
-        bool(msg.photo), bool(msg.video), bool(msg.document), bool(msg.forward_date),
-    )
-
-    # 1. 图片/视频 → 发作品
-    media_type, _ = extract_media(msg)
-    if media_type:
-        await on_admin_photo(update, context)
+    draft = _admin_drafts.get(user.id)
+    if not draft:
+        source = forward_chat(msg)
+        if source and source.type in ("channel", "group", "supergroup"):
+            await verify_and_bind(update, context, source.id, source.title or str(source.id), source.type)
         return
 
-    # 2. 有草稿 → 输入价格
-    if msg.text and not msg.text.startswith("/"):
-        if _admin_drafts.get(user.id):
-            await on_admin_prices(update, context)
+    step = draft.get("step")
+
+    if step == "await_content":
+        media_type, file_id = extract_media(msg)
+        if media_type:
+            caption = msg.caption or ""
+            src = forward_chat(msg)
+            if not caption and src:
+                caption = src.title or ""
+            draft.update({"media_type": media_type, "file_id": file_id, "caption": caption})
+        elif msg.text and not msg.text.startswith("/"):
+            draft.update({"media_type": "text", "file_id": "", "caption": msg.text})
+        else:
+            await msg.reply_text("请发送图片、视频或文字。")
             return
-        await msg.reply_text("请先发送图片或视频，再发三个价格（缅币）。")
+        draft["step"] = "await_prices"
+        await ask_prices(update)
         return
 
-    # 3. 转发纯文字 → 绑定群/频道
-    source = forward_chat(msg)
-    if source and source.type in ("channel", "group", "supergroup"):
-        await verify_and_bind(update, context, source.id, source.title or str(source.id), source.type)
+    if step == "await_prices" and msg.text and not msg.text.startswith("/"):
+        await on_admin_prices(update, context)
         return
-
-
-async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if update.effective_chat.type != "private" or not is_master(update.effective_user.id):
-            return
-        media_type, file_id = extract_media(update.message)
-        if not media_type:
-            await update.message.reply_text("❌ 请发送图片或视频。")
-            return
-        caption = update.message.caption or ""
-        src = forward_chat(update.message)
-        if not caption and src:
-            caption = src.title or ""
-        _admin_drafts[update.effective_user.id] = {
-            "media_type": media_type,
-            "file_id": file_id,
-            "caption": caption,
-        }
-        await update.message.reply_text(
-            "📸 收到作品！\n\n"
-            "请发送三个价格（买1个 / 买2个 / 买3个），单位为缅币：\n\n"
-            "例如：\n"
-            "<code>400000, 750000, 1000000</code>",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        log.exception("发作品失败")
-        await update.message.reply_text(f"❌ 处理失败：{e}")
 
 
 async def on_admin_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -633,15 +672,19 @@ async def on_admin_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_user.id
     draft = _admin_drafts.get(uid)
-    if not draft:
+    if not draft or draft.get("step") != "await_prices":
         return
 
     prices = parse_prices(update.message.text)
     if not prices:
-        await update.message.reply_text("❌ 格式不对，请发三个数字，例如：80, 150, 220")
+        await update.message.reply_text(
+            "❌ 格式不对，请发三个数字，例如：400000, 750000, 1000000\n"
+            "或点「无价发布」按钮",
+        )
         return
 
     draft["price1"], draft["price2"], draft["price3"] = prices
+    draft["no_price"] = False
     draft["step"] = "pick_target"
 
     targets = db_list_targets()
@@ -652,22 +695,13 @@ async def on_admin_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     default = db_get_default(uid)
     if default and any(t["id"] == default for t in targets):
-        lid = db_create_listing(
-            draft["media_type"], draft["file_id"], draft["caption"],
-            draft["price1"], draft["price2"], draft["price3"],
-        )
-        listing = db_get_listing(lid)
-        ok = await send_listing_to_chat(context, default, listing)
-        _admin_drafts.pop(uid, None)
-        await update.message.reply_text(
-            f"{'✅ 已发布到默认目标' if ok else '❌ 发布失败'}\n"
-            f"价格：{prices[0]} / {prices[1]} / {prices[2]}"
-        )
+        ok, msg = await finish_publish(context, uid, default, draft)
+        await update.message.reply_text(msg)
         return
 
     await update.message.reply_text(
-        f"价格已设置：{prices[0]} / {prices[1]} / {prices[2]}\n\n请选择发布到哪里：",
-        reply_markup=build_target_keyboard(targets, "sale"),
+        f"价格：{prices[0]} / {prices[1]} / {prices[2]}\n\n请选择发布到哪里：",
+        reply_markup=build_target_keyboard(targets, "pick"),
     )
 
 
@@ -878,26 +912,56 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
-    if action == "sale":
+    if action == "post":
+        draft = _admin_drafts.get(uid)
+        if value == "cancel":
+            _admin_drafts.pop(uid, None)
+            await query.edit_message_text("已取消发布。")
+        elif value == "noprice":
+            if not draft or draft.get("step") != "await_prices":
+                await query.answer("请先 /post 并发送内容", show_alert=True)
+                return
+            draft["no_price"] = True
+            draft["step"] = "pick_target"
+            targets = db_list_targets()
+            if not targets:
+                _admin_drafts.pop(uid, None)
+                await query.edit_message_text("请先绑定群/频道（/bind）")
+            else:
+                default = db_get_default(uid)
+                if default and any(t["id"] == default for t in targets):
+                    ok, msg = await finish_publish(context, uid, default, draft)
+                    await query.edit_message_text(msg)
+                else:
+                    await query.edit_message_text(
+                        "📝 无价发布 — 请选择发到哪里：",
+                        reply_markup=build_target_keyboard(targets, "pick"),
+                    )
+        await query.answer()
+        return
+
+    if action == "pick":
         draft = _admin_drafts.get(uid)
         if not draft or value == "cancel":
             _admin_drafts.pop(uid, None)
             await query.edit_message_text("已取消发布。")
             await query.answer()
             return
+        ok, msg = await finish_publish(context, uid, int(value), draft)
+        await query.edit_message_text(msg)
+        await query.answer()
+        return
 
-        lid = db_create_listing(
-            draft["media_type"], draft["file_id"], draft["caption"],
-            draft["price1"], draft["price2"], draft["price3"],
-        )
-        listing = db_get_listing(lid)
-        ok = await send_listing_to_chat(context, int(value), listing)
-        _admin_drafts.pop(uid, None)
-        await query.edit_message_text(
-            f"{'✅ 发布成功' if ok else '❌ 发布失败'}\n"
-            f"商品ID：{lid}\n"
-            f"价格：{listing['price1']}/{listing['price2']}/{listing['price3']}"
-        )
+    if action == "sale":
+        # 兼容旧按钮
+        draft = _admin_drafts.get(uid)
+        if not draft or value == "cancel":
+            _admin_drafts.pop(uid, None)
+            await query.edit_message_text("已取消发布。")
+            await query.answer()
+            return
+        ok, msg = await finish_publish(context, uid, int(value), draft)
+        await query.edit_message_text(msg)
         await query.answer()
         return
 
@@ -910,7 +974,7 @@ async def on_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await on_pay_click(update, context)
     elif data.startswith("review:"):
         await on_review_click(update, context)
-    elif data.startswith(("def:", "sale:")):
+    elif data.startswith(("def:", "sale:", "pick:", "post:")):
         await on_admin_callback(update, context)
 
 
@@ -956,8 +1020,8 @@ def create_app() -> Application:
 
     for cmd, handler in [
         ("start", cmd_start), ("help", cmd_help), ("ping", cmd_ping), ("id", cmd_id),
-        ("bind", cmd_bind), ("unbind", cmd_unbind), ("targets", cmd_targets),
-        ("default", cmd_default), ("setpay", cmd_setpay),
+        ("post", cmd_post), ("bind", cmd_bind), ("unbind", cmd_unbind),
+        ("targets", cmd_targets), ("default", cmd_default), ("setpay", cmd_setpay),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
         app.add_handler(CommandHandler(cmd, handler, filters=filters.UpdateType.CHANNEL_POSTS))
